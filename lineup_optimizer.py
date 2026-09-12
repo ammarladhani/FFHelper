@@ -1,9 +1,22 @@
 """
 Given a roster and league slot counts, determine the best legal
 starting lineup based on ESPN fantasy eligibility and projections.
+
+This solves the lineup as an actual optimal assignment problem
+(max-weight bipartite matching via scipy.optimize.linear_sum_assignment)
+rather than filling slots greedily in a fixed order. That matters
+whenever eligibility overlaps - e.g. a defensive tackle who's also
+eligible at DL and DP - since a greedy fill can lock a flexible
+player into the wrong slot before a less-flexible player is
+considered, which is not always fixable after the fact.
 """
 
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
 import config
+
+BIG = 1e9  # cost for an ineligible player/slot pairing - effectively "never assign this"
 
 
 def _slot_id(slot_name: str):
@@ -18,132 +31,80 @@ def _eligible_for_slot(player: dict, slot_name: str) -> bool:
     """
     Determine whether ESPN says this player can occupy this slot.
 
-    eligible_slots contains ESPN slot IDs. This is the authoritative
-    fantasy eligibility information.
+    eligible_slots contains ESPN slot IDs - this is the authoritative
+    fantasy eligibility (a player's nominal `position` does not
+    necessarily list every slot they can legally start in).
 
-    Falls back to the old position-based behavior for players from an
-    older database that don't yet have eligibility populated.
+    Falls back to a position-string match for older rows that don't
+    have eligibility populated yet.
     """
     eligible_slots = player.get("eligible_slots")
-
     if eligible_slots:
         slot_id = _slot_id(slot_name)
-
         if slot_id is not None:
             return slot_id in eligible_slots
-
-    # Backward-compatible fallback for old/incomplete data.
     return player.get("position") == slot_name
+
+
+def _is_eligible(player: dict, slot_name: str) -> bool:
+    """Flex-type slots (FLEX, RB/WR, OP, ...) aren't real ESPN eligibility
+    slots - they're league lineup categories - so they're checked against
+    the player's own position instead of eligible_slots."""
+    if slot_name in config.FLEX_SLOT_ELIGIBILITY:
+        return player.get("position") in config.FLEX_SLOT_ELIGIBILITY[slot_name]
+    return _eligible_for_slot(player, slot_name)
 
 
 def optimize_lineup(players: list, slot_counts: dict) -> dict:
     """
-    players: list of dicts with:
-        player_id
-        name
-        position
-        eligible_slots
-        projected
-
-    slot_counts:
-        {"QB": 1, "RB": 2, "WR": 2, ...}
+    players: list of dicts with player_id, name, position, eligible_slots, projected
+    slot_counts: {"QB": 1, "RB": 2, ..., "BE": 7, "IR": 2}
 
     Returns:
         {
-            "lineup": {slot_name: [player, ...]},
-            "bench": [player, ...],
+            "lineup": {slot_name: [player, ...]},   # scoring slots only
+            "bench": [player, ...],                 # BE/IR + anyone unassigned
             "total_points": float,
         }
     """
+    pool = [dict(p, projected=(p.get("projected") or 0.0)) for p in players]
 
-    pool = [
-        dict(p, projected=(p.get("projected") or 0.0))
-        for p in players
-    ]
+    # Expand slot_counts into individual slot instances, e.g. RB:2 -> two
+    # separate "RB" instances, so each can be assigned to a different player.
+    slot_instances = []
+    for slot_name, count in slot_counts.items():
+        scores = slot_name not in config.NON_STARTING_SLOTS
+        for _ in range(count):
+            slot_instances.append((slot_name, scores))
+
+    if not pool or not slot_instances:
+        return {"lineup": {}, "bench": pool, "total_points": 0.0}
+
+    n_players = len(pool)
+    n_slots = len(slot_instances)
+
+    cost = np.full((n_players, n_slots), BIG)
+    for i, p in enumerate(pool):
+        for j, (slot_name, scores) in enumerate(slot_instances):
+            if _is_eligible(p, slot_name):
+                cost[i, j] = -p["projected"] if scores else 0.0
+
+    row_ind, col_ind = linear_sum_assignment(cost)
 
     lineup = {}
-    used_ids = set()
+    assigned_ids = set()
+    total_points = 0.0
 
-    # 1. Fixed starting slots first.
-    fixed_slots = [
-        (name, count)
-        for name, count in slot_counts.items()
-        if (
-            name not in config.FLEX_SLOT_ELIGIBILITY
-            and name not in config.NON_STARTING_SLOTS
-        )
-    ]
+    for r, c in zip(row_ind, col_ind):
+        if cost[r, c] >= BIG:
+            continue  # no eligible slot found for this player - leave on bench
+        player = pool[r]
+        slot_name, scores = slot_instances[c]
+        assigned_ids.add(player["player_id"])
+        if scores:
+            lineup.setdefault(slot_name, []).append(player)
+            total_points += player["projected"]
 
-    for slot_name, count in fixed_slots:
-        candidates = sorted(
-            (
-                p
-                for p in pool
-                if (
-                    _eligible_for_slot(p, slot_name)
-                    and p["player_id"] not in used_ids
-                )
-            ),
-            key=lambda p: p["projected"],
-            reverse=True,
-        )
+    bench = [p for p in pool if p["player_id"] not in assigned_ids]
 
-        chosen = candidates[:count]
-
-        lineup[slot_name] = chosen
-        used_ids.update(
-            p["player_id"]
-            for p in chosen
-        )
-
-    # 2. Flex-like slots.
-    #
-    # These still use the configured fantasy-position rules because
-    # FLEX/RB-WR/etc. aren't ESPN IDP eligibility slots.
-    flex_slots = [
-        (name, count)
-        for name, count in slot_counts.items()
-        if name in config.FLEX_SLOT_ELIGIBILITY
-    ]
-
-    for slot_name, count in flex_slots:
-        eligible_positions = config.FLEX_SLOT_ELIGIBILITY[slot_name]
-
-        candidates = sorted(
-            (
-                p
-                for p in pool
-                if (
-                    p["position"] in eligible_positions
-                    and p["player_id"] not in used_ids
-                )
-            ),
-            key=lambda p: p["projected"],
-            reverse=True,
-        )
-
-        chosen = candidates[:count]
-
-        lineup[slot_name] = chosen
-        used_ids.update(
-            p["player_id"]
-            for p in chosen
-        )
-
-    bench = [
-        p
-        for p in pool
-        if p["player_id"] not in used_ids
-    ]
-
-    total_points = sum(
-        p["projected"]
-        for group in lineup.values()
-        for p in group
-    )
-
-    return {
-        "lineup": lineup,
-        "bench": bench,
-        "total_points": total_points,
-    }
+    return {"lineup": lineup, "bench": bench, "total_points": total_points}
