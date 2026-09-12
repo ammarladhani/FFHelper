@@ -4,6 +4,7 @@ Read-only query helpers over the local database. Everything downstream
 of writing raw SQL inline.
 """
 
+import json
 
 def get_slot_counts(conn, league_key: str) -> dict:
     rows = conn.execute(
@@ -66,35 +67,69 @@ def get_free_agents_ranked(conn, league_key: str, as_of_week: int, start_week: i
 
 def get_player_info(conn, player_id: int) -> dict:
     row = conn.execute(
-        "SELECT player_id, name, position FROM players WHERE player_id = ?",
+        """
+        SELECT player_id, name, position, eligible_slots
+        FROM players
+        WHERE player_id = ?
+        """,
         (player_id,),
     ).fetchone()
+
     if not row:
         return None
-    return {"player_id": row[0], "name": row[1], "position": row[2]}
+
+    try:
+        eligible_slots = json.loads(row[3]) if row[3] else []
+    except (TypeError, json.JSONDecodeError):
+        eligible_slots = []
+
+    return {
+        "player_id": row[0],
+        "name": row[1],
+        "position": row[2],
+        "eligible_slots": eligible_slots,
+    }
 
 
 def get_projection(conn, league_key: str, player_id: int, week: int):
     row = conn.execute(
-        "SELECT projected_points FROM projections WHERE league_key = ? AND player_id = ? AND week = ?",
+        """
+        SELECT projected_points
+        FROM projections
+        WHERE league_key = ?
+          AND player_id = ?
+          AND week = ?
+        """,
         (league_key, player_id, week),
     ).fetchone()
+
     return row[0] if row else None
 
 
-def get_roster_with_projection(conn, league_key: str, player_ids: list, week: int) -> list:
-    """Build the list of player dicts (with this week's projection) that
-    the lineup optimizer expects, for an arbitrary set of player_ids."""
+def get_roster_with_projection(
+    conn,
+    league_key: str,
+    player_ids: list,
+    week: int,
+) -> list:
+    """Build player dicts for the lineup optimizer."""
     players = []
+
     for pid in player_ids:
         info = get_player_info(conn, pid)
+
         if not info:
             continue
+
         proj = get_projection(conn, league_key, pid, week)
+
         players.append({
             "player_id": pid,
             "name": info["name"],
             "position": info["position"],
+            "eligible_slots": info["eligible_slots"],
             "projected": proj,
         })
+
     return players
+

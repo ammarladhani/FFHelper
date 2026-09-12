@@ -2,11 +2,12 @@
 SQLite storage layer. One local database file holds every league.
 """
 
+import json
 import sqlite3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS leagues (
-    league_key   TEXT PRIMARY KEY,   -- the short slug from config.py, e.g. "my_league"
+    league_key   TEXT PRIMARY KEY,
     league_id    INTEGER NOT NULL,
     season       INTEGER NOT NULL
 );
@@ -28,10 +29,11 @@ CREATE TABLE IF NOT EXISTS league_settings (
 );
 
 CREATE TABLE IF NOT EXISTS players (
-    player_id    INTEGER PRIMARY KEY,
-    name         TEXT,
-    position     TEXT,
-    pro_team_id  INTEGER
+    player_id      INTEGER PRIMARY KEY,
+    name           TEXT,
+    position       TEXT,
+    pro_team_id    INTEGER,
+    eligible_slots TEXT
 );
 
 CREATE TABLE IF NOT EXISTS projections (
@@ -46,7 +48,7 @@ CREATE TABLE IF NOT EXISTS ownership (
     league_key   TEXT NOT NULL,
     player_id    INTEGER NOT NULL,
     week         INTEGER NOT NULL,
-    team_id      INTEGER,            -- NULL = free agent
+    team_id      INTEGER,
     PRIMARY KEY (league_key, player_id, week)
 );
 """
@@ -60,52 +62,105 @@ def get_conn(db_path: str) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection):
     conn.executescript(SCHEMA)
+
+    # Existing databases won't get new columns from CREATE TABLE IF NOT EXISTS.
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(players)").fetchall()
+    }
+
+    if "eligible_slots" not in columns:
+        conn.execute(
+            "ALTER TABLE players ADD COLUMN eligible_slots TEXT"
+        )
+
     conn.commit()
 
 
 def upsert_league(conn, league_key, league_id, season):
     conn.execute(
         "INSERT INTO leagues (league_key, league_id, season) VALUES (?, ?, ?) "
-        "ON CONFLICT(league_key) DO UPDATE SET league_id=excluded.league_id, season=excluded.season",
+        "ON CONFLICT(league_key) DO UPDATE SET "
+        "league_id=excluded.league_id, season=excluded.season",
         (league_key, league_id, season),
     )
 
 
 def upsert_team(conn, league_key, team_id, team_name, manager_name):
     conn.execute(
-        "INSERT INTO teams (league_key, team_id, team_name, manager_name) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(league_key, team_id) DO UPDATE SET team_name=excluded.team_name, manager_name=excluded.manager_name",
+        "INSERT INTO teams "
+        "(league_key, team_id, team_name, manager_name) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(league_key, team_id) DO UPDATE SET "
+        "team_name=excluded.team_name, "
+        "manager_name=excluded.manager_name",
         (league_key, team_id, team_name, manager_name),
     )
 
 
 def upsert_setting(conn, league_key, slot_id, slot_name, count):
     conn.execute(
-        "INSERT INTO league_settings (league_key, slot_id, slot_name, count) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(league_key, slot_id) DO UPDATE SET count=excluded.count",
+        "INSERT INTO league_settings "
+        "(league_key, slot_id, slot_name, count) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(league_key, slot_id) DO UPDATE SET "
+        "count=excluded.count",
         (league_key, slot_id, slot_name, count),
     )
 
 
-def upsert_player(conn, player_id, name, position, pro_team_id):
+def upsert_player(
+    conn,
+    player_id,
+    name,
+    position,
+    pro_team_id,
+    eligible_slots=None,
+):
+    eligible_slots_json = (
+        json.dumps(sorted(set(eligible_slots)))
+        if eligible_slots is not None
+        else None
+    )
+
     conn.execute(
-        "INSERT INTO players (player_id, name, position, pro_team_id) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(player_id) DO UPDATE SET name=excluded.name, position=excluded.position, pro_team_id=excluded.pro_team_id",
-        (player_id, name, position, pro_team_id),
+        """
+        INSERT INTO players
+            (player_id, name, position, pro_team_id, eligible_slots)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(player_id) DO UPDATE SET
+            name=excluded.name,
+            position=excluded.position,
+            pro_team_id=excluded.pro_team_id,
+            eligible_slots=excluded.eligible_slots
+        """,
+        (
+            player_id,
+            name,
+            position,
+            pro_team_id,
+            eligible_slots_json,
+        ),
     )
 
 
 def upsert_projection(conn, league_key, player_id, week, projected_points):
     conn.execute(
-        "INSERT INTO projections (league_key, player_id, week, projected_points) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(league_key, player_id, week) DO UPDATE SET projected_points=excluded.projected_points",
+        "INSERT INTO projections "
+        "(league_key, player_id, week, projected_points) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(league_key, player_id, week) DO UPDATE SET "
+        "projected_points=excluded.projected_points",
         (league_key, player_id, week, projected_points),
     )
 
 
 def upsert_ownership(conn, league_key, player_id, week, team_id):
     conn.execute(
-        "INSERT INTO ownership (league_key, player_id, week, team_id) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(league_key, player_id, week) DO UPDATE SET team_id=excluded.team_id",
+        "INSERT INTO ownership "
+        "(league_key, player_id, week, team_id) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(league_key, player_id, week) DO UPDATE SET "
+        "team_id=excluded.team_id",
         (league_key, player_id, week, team_id),
     )

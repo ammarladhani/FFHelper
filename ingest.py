@@ -59,16 +59,17 @@ def ingest_week(conn, league_cfg, league_key, season, week):
             None,
         )
 
-        db.upsert_player(conn, player_id, name, position, pro_team_id)
-        if name == "Derrick Brown":
-            print("\n=== RAW DERRICK BROWN ===")
-            print(p)
-            print("=== PLAYER OBJECT ===")
-            print(player_obj)
-            print("=== defaultPositionId ===")
-            print(pos_id)
-            print("=== mapped position ===")
-            print(position)
+        eligible_slots = player_obj.get("eligibleSlots", [])
+
+        db.upsert_player(
+            conn,
+            player_id,
+            name,
+            position,
+            pro_team_id,
+            eligible_slots,
+        )
+        
         db.upsert_projection(conn, league_key, player_id, week, projected)
         db.upsert_ownership(conn, league_key, player_id, week, team_id)
 
