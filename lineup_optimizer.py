@@ -141,10 +141,6 @@ def optimize_lineup(players: list, slot_counts: dict) -> dict:
         for group in lineup.values()
         for p in group
     )
-    print()
-
-    for player in lineup.values():
-        print(player)
 
     return {
         "lineup": lineup,
