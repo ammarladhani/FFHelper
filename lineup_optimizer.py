@@ -1,6 +1,12 @@
 """
 Given a roster and league slot counts, determine the best legal
-starting lineup based on ESPN fantasy eligibility and projections.
+starting lineup based on fantasy eligibility and projections. Works
+for any platform (ESPN, Sleeper, ...) as long as each player's
+`eligible_slots` is a list of SLOT NAME STRINGS scoped to that
+player's own league (e.g. ["QB", "BN"] or ["DT", "DL", "BN", "IR"]) -
+ingestion is responsible for translating a platform's native
+eligibility format (numeric IDs for ESPN, position strings natively
+for Sleeper) into this common shape.
 
 This solves the lineup as an actual optimal assignment problem
 (max-weight bipartite matching via scipy.optimize.linear_sum_assignment)
@@ -17,38 +23,26 @@ from scipy.optimize import linear_sum_assignment
 import config
 
 BIG = 1e9  # cost for an ineligible player/slot pairing - effectively "never assign this"
-_SLOT_ID_CACHE = {
-    name: slot_id
-    for slot_id, name in config.SLOT_MAP.items()
-}
 
-def _slot_id(slot_name: str):
-    """Return ESPN slot ID for a readable slot name."""
-    return _SLOT_ID_CACHE.get(slot_name)
 
 def _eligible_for_slot(player: dict, slot_name: str) -> bool:
     """
-    Determine whether ESPN says this player can occupy this slot.
-
-    eligible_slots contains ESPN slot IDs - this is the authoritative
-    fantasy eligibility (a player's nominal `position` does not
-    necessarily list every slot they can legally start in).
+    Determine whether this player can occupy this slot, per their
+    (platform-normalized) eligible_slots list of slot name strings.
 
     Falls back to a position-string match for older rows that don't
     have eligibility populated yet.
     """
     eligible_slots = player.get("eligible_slots")
     if eligible_slots:
-        slot_id = _slot_id(slot_name)
-        if slot_id is not None:
-            return slot_id in eligible_slots
+        return slot_name in eligible_slots
     return player.get("position") == slot_name
 
 
 def _is_eligible(player: dict, slot_name: str) -> bool:
-    """Flex-type slots (FLEX, RB/WR, OP, ...) aren't real ESPN eligibility
-    slots - they're league lineup categories - so they're checked against
-    the player's own position instead of eligible_slots."""
+    """Flex-type slots (FLEX, RB/WR, OP, ...) are league lineup categories
+    rather than a real eligibility slot on most platforms, so they're
+    checked against the player's own position instead of eligible_slots."""
     if slot_name in config.FLEX_SLOT_ELIGIBILITY:
         return player.get("position") in config.FLEX_SLOT_ELIGIBILITY[slot_name]
     return _eligible_for_slot(player, slot_name)

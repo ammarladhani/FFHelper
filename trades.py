@@ -21,7 +21,8 @@ from simulator import simulate_roster
 def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
                    team_b_id: int, team_b_gives: list, start_week: int, end_week: int,
                    as_of_week: int = None, slot_counts: dict = None,
-                   baseline_a: dict = None, baseline_b: dict = None) -> dict:
+                   baseline_a: dict = None, baseline_b: dict = None, player_info_cache: dict = None,
+projection_cache: dict = None) -> dict:
     as_of_week = as_of_week or start_week
 
     if slot_counts is None:
@@ -46,11 +47,25 @@ def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
     new_b_ids = [pid for pid in b_ids if pid not in team_b_gives] + team_a_gives
 
     new_a = simulate_roster(
-        conn, league_key, new_a_ids, slot_counts, start_week, end_week
+        conn,
+        league_key,
+        new_a_ids,
+        slot_counts,
+        start_week,
+        end_week,
+        player_info_cache,
+        projection_cache,
     )
 
     new_b = simulate_roster(
-        conn, league_key, new_b_ids, slot_counts, start_week, end_week
+        conn,
+        league_key,
+        new_b_ids,
+        slot_counts,
+        start_week,
+        end_week,
+        player_info_cache,
+        projection_cache,
     )
 
     return {
@@ -69,23 +84,45 @@ def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
     }
 
 
-def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_week: int,
-                    as_of_week: int = None, top_n: int = 10, candidate_prefilter: int = 12,
-                    combo_sizes=(1,)) -> list:
+def suggest_trades(
+    conn,
+    league_key: str,
+    my_team_id: int,
+    start_week: int,
+    end_week: int,
+    as_of_week: int = None,
+    top_n: int = 100,
+    candidate_prefilter: int = 15,
+    combo_sizes=(1,2,),
+) -> list:
     """
-    Search win-win 1-for-1 (and optionally larger, via combo_sizes)
-    trades between my_team_id and every other team in the league.
+    Search win-win trades between my_team_id and every other team.
+
+    A trade is accepted only if:
+      - Both teams improve (delta > 0)
+      - The two teams' gains are within 2x of each other.
+        In other words:
+            0.5 * partner_delta <= my_delta <= 2 * partner_delta
+
+    Prints each qualifying trade as it is found.
+
+    At the end, prints the most common positions:
+      - being traded away by my team
+      - being received by my team
 
     candidate_prefilter limits each side's roster to its top N players
     by naive rest-of-season projected sum before generating trade
-    combinations, since full combinatorics over a ~15-man roster on
-    both sides explodes quickly.
+    combinations.
     """
     start = time.perf_counter()
     as_of_week = as_of_week or start_week
+
     teams = repo.get_teams(conn, league_key)
     slot_counts = repo.get_slot_counts(conn, league_key)
 
+    player_info_cache = {}
+    projection_cache = {}
+    # My roster
     my_ids_full = repo.get_roster_player_ids(
         conn, league_key, my_team_id, as_of_week
     )
@@ -106,15 +143,15 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
         slot_counts,
         start_week,
         end_week,
+        player_info_cache,
+        projection_cache,
     )
-
-    my_ids_full = repo.get_roster_player_ids(conn, league_key, my_team_id, as_of_week)
-    my_candidates = _top_players_by_rest_of_season(conn, league_key, my_ids_full, start_week, end_week, candidate_prefilter)
 
     proposals = []
 
     for team in teams:
         other_id = team["team_id"]
+
         if other_id == my_team_id:
             continue
 
@@ -138,10 +175,14 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
             slot_counts,
             start_week,
             end_week,
+            player_info_cache,
+            projection_cache,
         )
+
         for size in combo_sizes:
             for my_combo in combinations(my_candidates, size):
                 for other_combo in combinations(other_candidates, size):
+
                     result = evaluate_trade(
                         conn,
                         league_key,
@@ -155,21 +196,108 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
                         slot_counts,
                         my_baseline,
                         other_baseline,
+                        player_info_cache,
+                        projection_cache,
                     )
-                    if result["team_a"]["delta"] > 0 and result["team_b"]["delta"] > 0:
-                        proposals.append({
-                            "give": [repo.get_player_info(conn, pid) for pid in my_combo],
-                            "get": [repo.get_player_info(conn, pid) for pid in other_combo],
-                            "partner_team_id": other_id,
-                            "partner_team_name": team["team_name"],
-                            "my_delta": result["team_a"]["delta"],
-                            "partner_delta": result["team_b"]["delta"],
-                        })
 
-    proposals.sort(key=lambda p: p["my_delta"], reverse=True)
+                    my_delta = result["team_a"]["delta"]
+                    partner_delta = result["team_b"]["delta"]
+
+                    # Both teams must improve
+                    if my_delta <= 0 or partner_delta <= 0:
+                        continue
+                    
+                    proposal = {
+                        "give": [
+                            repo.get_player_info(conn, pid)
+                            for pid in my_combo
+                        ],
+                        "get": [
+                            repo.get_player_info(conn, pid)
+                            for pid in other_combo
+                        ],
+                        "partner_team_id": other_id,
+                        "partner_team_name": team["team_name"],
+                        "my_delta": my_delta,
+                        "partner_delta": partner_delta,
+                    }
+
+                    proposals.append(proposal)
+
+                    # Print immediately
+                    give_names = ", ".join(
+                        p["name"] for p in proposal["give"]
+                    )
+                    get_names = ", ".join(
+                        p["name"] for p in proposal["get"]
+                    )
+
+                    print(
+                        f"TRADE FOUND | "
+                        f"Give: {give_names} | "
+                        f"Get: {get_names} | "
+                        f"Partner: {proposal['partner_team_name']} | "
+                        f"My Δ: {my_delta:.2f} | "
+                        f"Partner Δ: {partner_delta:.2f}"
+                    )
+
+    proposals.sort(key=lambda p: p["my_delta"]+p["partner_delta"], reverse=True)
+
+    # Only analyze trades that will actually be returned.
+    returned_proposals = proposals[:top_n]
+
+    # Position summaries
+    from collections import Counter
+
+    give_positions = Counter()
+    get_positions = Counter()
+
+    for proposal in returned_proposals:
+        for player in proposal["give"]:
+            position = player.get("position")
+            if position:
+                give_positions[position] += 1
+
+        for player in proposal["get"]:
+            position = player.get("position")
+            if position:
+                get_positions[position] += 1
+
+    if give_positions:
+        max_give = max(give_positions.values())
+        most_common_give = [
+            pos for pos, count in give_positions.items()
+            if count == max_give
+        ]
+
+        print(
+            "Most common position(s) trading away: "
+            f"{', '.join(most_common_give)} "
+            f"({max_give})"
+        )
+    else:
+        print("Most common position(s) trading away: none")
+
+    if get_positions:
+        max_get = max(get_positions.values())
+        most_common_get = [
+            pos for pos, count in get_positions.items()
+            if count == max_get
+        ]
+
+        print(
+            "Most common position(s) receiving: "
+            f"{', '.join(most_common_get)} "
+            f"({max_get})"
+        )
+    else:
+        print("Most common position(s) receiving: none")
+
     end = time.perf_counter()
-    print(f"time: ", {end-start}, " seconds")
-    return proposals[:top_n]
+    print(f"time: {end - start:.2f} seconds")
+
+    return returned_proposals
+
 
 
 def _top_players_by_rest_of_season(

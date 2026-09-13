@@ -36,7 +36,7 @@ def cmd_simulate(args, conn):
 def cmd_waiver(args, conn):
     results = waiver.best_pickups(
         conn, args.league, args.team, args.start_week, args.end_week,
-        as_of_week=args.as_of_week, top_n=args.top_n,
+        as_of_week=args.as_of_week, top_n=1000,
     )
     print(f"\nTop pickups for team_id={args.team} (weeks {args.start_week}-{args.end_week}):\n")
     for r in results:
@@ -133,24 +133,24 @@ def build_parser():
     p = sub.add_parser("waiver-why")
     add_common(p)
     p.add_argument("--team", type=int, required=True)
-    p.add_argument("--add", type=int, required=True, help="player_id to add")
-    p.add_argument("--drop", type=int, required=True, help="player_id to drop")
+    p.add_argument("--add", type=str, required=True, help="player_id to add")
+    p.add_argument("--drop", type=str, required=True, help="player_id to drop")
     p.set_defaults(func=cmd_waiver_why)
 
     p = sub.add_parser("trade-evaluate")
     add_common(p)
     p.add_argument("--team-a", type=int, required=True, dest="team_a")
-    p.add_argument("--give", type=int, nargs="+", required=True, help="player_id(s) team A gives up")
+    p.add_argument("--give", type=str, nargs="+", required=True, help="player_id(s) team A gives up")
     p.add_argument("--team-b", type=int, required=True, dest="team_b")
-    p.add_argument("--get", type=int, nargs="+", required=True, help="player_id(s) team A receives")
+    p.add_argument("--get", type=str, nargs="+", required=True, help="player_id(s) team A receives")
     p.set_defaults(func=cmd_trade_evaluate)
 
     p = sub.add_parser("trade-why")
     add_common(p)
     p.add_argument("--team-a", type=int, required=True, dest="team_a")
-    p.add_argument("--give", type=int, nargs="+", required=True, help="player_id(s) team A gives up")
+    p.add_argument("--give", type=str, nargs="+", required=True, help="player_id(s) team A gives up")
     p.add_argument("--team-b", type=int, required=True, dest="team_b")
-    p.add_argument("--get", type=int, nargs="+", required=True, help="player_id(s) team A receives")
+    p.add_argument("--get", type=str, nargs="+", required=True, help="player_id(s) team A receives")
     p.set_defaults(func=cmd_trade_why)
 
     p = sub.add_parser("trade-suggest")

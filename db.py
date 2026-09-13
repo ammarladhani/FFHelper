@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS league_settings (
 );
 
 CREATE TABLE IF NOT EXISTS players (
-    player_id      INTEGER PRIMARY KEY,
+    player_id      TEXT PRIMARY KEY,
     name           TEXT,
     position       TEXT,
     pro_team_id    INTEGER,
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS players (
 
 CREATE TABLE IF NOT EXISTS projections (
     league_key       TEXT NOT NULL,
-    player_id        INTEGER NOT NULL,
+    player_id        TEXT NOT NULL,
     week             INTEGER NOT NULL,
     projected_points REAL,
     PRIMARY KEY (league_key, player_id, week)
@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS projections (
 
 CREATE TABLE IF NOT EXISTS ownership (
     league_key   TEXT NOT NULL,
-    player_id    INTEGER NOT NULL,
+    player_id    TEXT NOT NULL,
     week         INTEGER NOT NULL,
     team_id      INTEGER,
     PRIMARY KEY (league_key, player_id, week)
@@ -63,16 +63,13 @@ def get_conn(db_path: str) -> sqlite3.Connection:
 def init_schema(conn: sqlite3.Connection):
     conn.executescript(SCHEMA)
 
-    # Existing databases won't get new columns from CREATE TABLE IF NOT EXISTS.
     columns = {
         row[1]
         for row in conn.execute("PRAGMA table_info(players)").fetchall()
     }
 
     if "eligible_slots" not in columns:
-        conn.execute(
-            "ALTER TABLE players ADD COLUMN eligible_slots TEXT"
-        )
+        conn.execute("ALTER TABLE players ADD COLUMN eligible_slots TEXT")
 
     conn.commit()
 

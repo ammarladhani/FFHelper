@@ -1,40 +1,39 @@
 """
-Configuration for all leagues the system should track.
+Configuration for all leagues the system should track - across
+platforms. Each entry needs a "platform" key: "espn" or "sleeper".
 
-Add one entry per league you want to pull data for. If you and your
-girlfriend are in different leagues (even under different ESPN
-accounts), just add a second entry with her own SWID/espn_s2 cookies.
-If you're in the SAME league, list it once.
+ESPN entries need SWID/espn_s2 cookies (pull fresh from browser dev
+tools: Network tab -> any fantasy.espn.com request -> Cookies).
 
-Pull fresh SWID / espn_s2 values from browser dev tools:
-Network tab -> any fantasy.espn.com request -> Cookies.
+Sleeper entries need only a league_id - Sleeper's read API is public,
+no auth required. Find your league_id in the URL when viewing your
+league on sleeper.com, e.g. sleeper.com/leagues/<LEAGUE_ID>.
 """
 
 SEASON = 2026
 
 LEAGUES = [
     {
+        "platform": "espn",
         "name": "my_league",           # short slug, used as a label everywhere
         "league_id": 2077647142,
         "swid": "{43F9DA5A-2D52-43C1-B9C7-DE593AD0A84D}",
         "espn_s2": "AECeQlAUWUXSLPLFvcTWSK3dNeVePYmFPRiSVZNHo6eQCN7TGmoGGUPSL3rl7ncIyV2gtvv4zs23vU%2BgGaQ2yLeZGbNVfW8KWwNHBxIWRaP%2BRJrI8N0qZCrZL4Cq7FLSLrRMASripTOOyUFM%2B6%2BooTb8vOCstns77WComij0Q4ak%2Bp9wO%2F8SYzZatg13kw3xDhSt%2BHvIzuo9ChW2yK%2BO6G7tumnnpCaDTEjLTSSA9JNTKnoHgrtgajh5d7Ok%2BY0d0s8Pn0g1OqZckx%2F0x%2BMYiROhpcYoW84hCxZoGVTuq78oCQ%3D%3D",
-        "my_team_id": 11,            # fill in once you know your team_id (see `python cli.py list-teams`)
+        "my_team_id": 11,
     },
-    # Uncomment and fill in if your girlfriend is in a separate league:
-    # {
-    #     "name": "gf_league",
-    #     "league_id": 0000000000,
-    #     "swid": "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}",
-    #     "espn_s2": "PASTE_HER_ESPN_S2_VALUE_HERE",
-    #     "my_team_id": None,
-    # },
+    {
+        "platform": "sleeper",
+        "name": "sleeper_league",
+        "league_id": "1322365155329216512",
+        "my_team_id": 3,            # fill in with your roster_id after list-teams
+    },
 ]
- 
+
 START_WEEK = 1
 END_WEEK = 18
- 
+
 DB_PATH = "fantasy.db"
- 
+
 # ESPN's default lineup slot ID -> readable name (standard mapping used
 # across ESPN fantasy API tooling).
 SLOT_MAP = {
@@ -43,8 +42,9 @@ SLOT_MAP = {
     14: "DB", 15: "DP", 16: "D/ST", 17: "K", 18: "P", 19: "HC",
     20: "BE", 21: "IR", 22: "", 23: "FLEX", 24: "EDR", 25: "Rookie",
 }
- 
-# Player's default position ID -> readable name.
+
+# Player's default position ID -> readable name (ESPN only - Sleeper
+# reports position as a plain string natively, no ID lookup needed).
 # ESPN uses two separate numbering schemes that happen not to collide:
 # offensive positions (+ D/ST) use one set of codes, individual defensive
 # player (IDP) positions use another. Both are needed for IDP leagues.
@@ -54,20 +54,20 @@ POSITION_MAP = {
     8: "DT", 9: "DE", 10: "LB", 11: "DL", 12: "CB", 13: "S",
     14: "DB", 15: "DP", 7: "P",
 }
- 
+
 # Which slot names count as "eligible for FLEX"
 FLEX_ELIGIBLE = {"RB", "WR", "TE"}
- 
+
 # Multi-position ("flex-like") slots and which player positions can fill them.
-# Fixed single-position slots (QB, RB, WR, TE, K, D/ST) aren't listed here -
-# a player fills those only if their own position matches exactly.
+# Fixed single-position slots (QB, RB, WR, TE, K, D/ST, DEF, ...) aren't
+# listed here - a player fills those only via their real eligible_slots.
 FLEX_SLOT_ELIGIBILITY = {
     "FLEX": {"RB", "WR", "TE"},
     "RB/WR": {"RB", "WR"},
     "WR/TE": {"WR", "TE"},
     "OP": {"QB", "RB", "WR", "TE"},
+    "SUPER_FLEX": {"QB", "RB", "WR", "TE"},  # Sleeper's superflex slot name
 }
- 
+
 # Slot names that never count toward a team's scoring lineup.
-NON_STARTING_SLOTS = {"BE", "IR", ""}
- 
+NON_STARTING_SLOTS = {"BE", "BN", "IR", ""}

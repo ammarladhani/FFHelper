@@ -1,3 +1,4 @@
+
 """
 For a given team, find which free agent add/drop combination maximizes
 the team's remaining-season optimized point total.
@@ -8,24 +9,88 @@ query) before running the expensive lineup-optimizer-based delta
 calculation on each candidate.
 """
 
+import time
+
 import repo
 from simulator import simulate_roster
 
 
 def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week: int,
-                  as_of_week: int = None, top_n: int = 10, fa_prefilter: int = 40) -> list:
-    as_of_week = as_of_week or start_week
-    slot_counts = repo.get_slot_counts(conn, league_key)
-    current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
+                 as_of_week: int = None, top_n: int = 10, fa_prefilter: int = 2533) -> list:
+    total_start = time.perf_counter()
 
-    baseline = simulate_roster(conn, league_key, current_ids, slot_counts, start_week, end_week)
+    as_of_week = as_of_week or start_week
+
+    # ---------------------------------------------------------
+    # Setup
+    # ---------------------------------------------------------
+    setup_start = time.perf_counter()
+
+    slot_counts = repo.get_slot_counts(conn, league_key)
+    current_ids = repo.get_roster_player_ids(
+        conn, league_key, team_id, as_of_week
+    )
+
+    # Shared caches for every simulate_roster() call in this run.
+    player_info_cache = {}
+    projection_cache = {}
+
+    setup_time = time.perf_counter() - setup_start
+
+    # ---------------------------------------------------------
+    # Baseline
+    # ---------------------------------------------------------
+    baseline_start = time.perf_counter()
+
+    baseline = simulate_roster(
+        conn,
+        league_key,
+        current_ids,
+        slot_counts,
+        start_week,
+        end_week,
+        player_info_cache,
+        projection_cache,
+    )
     baseline_total = baseline["total"]
 
-    fa_ids = repo.get_free_agents_ranked(conn, league_key, as_of_week, start_week, end_week, limit=fa_prefilter)
+    baseline_time = time.perf_counter() - baseline_start
+
+    # ---------------------------------------------------------
+    # Free-agent prefilter
+    # ---------------------------------------------------------
+    fa_start = time.perf_counter()
+
+    fa_ids = repo.get_free_agents_ranked(
+        conn,
+        league_key,
+        as_of_week,
+        start_week,
+        end_week,
+        limit=fa_prefilter,
+    )
+
+    fa_time = time.perf_counter() - fa_start
 
     results = []
+
+    fa_info_time = 0.0
+    simulation_time = 0.0
+    drop_info_time = 0.0
+    simulation_count = 0
+
+    # ---------------------------------------------------------
+    # Candidate evaluation
+    # ---------------------------------------------------------
+    candidate_start = time.perf_counter()
+
     for fa_id in fa_ids:
+        info_start = time.perf_counter()
+
         fa_info = repo.get_player_info(conn, fa_id)
+
+        fa_info_time += time.perf_counter() - info_start
+
         if not fa_info:
             continue
 
@@ -34,12 +99,36 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
 
         for drop_id in current_ids:
             new_ids = [pid for pid in current_ids if pid != drop_id] + [fa_id]
-            sim = simulate_roster(conn, league_key, new_ids, slot_counts, start_week, end_week)
+
+            sim_start = time.perf_counter()
+
+            sim = simulate_roster(
+                conn,
+                league_key,
+                new_ids,
+                slot_counts,
+                start_week,
+                end_week,
+                player_info_cache,
+                projection_cache,
+            )
+
+            simulation_time += time.perf_counter() - sim_start
+            simulation_count += 1
+
             delta = sim["total"] - baseline_total
 
             if best_delta is None or delta > best_delta:
                 best_delta = delta
-                best_drop_info = repo.get_player_info(conn, drop_id)
+
+                drop_info_start = time.perf_counter()
+
+                best_drop_info = repo.get_player_info(
+                    conn,
+                    drop_id,
+                )
+
+                drop_info_time += time.perf_counter() - drop_info_start
 
         results.append({
             "add": fa_info,
@@ -47,8 +136,45 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
             "projected_gain": round(best_delta, 2) if best_delta is not None else None,
         })
 
-    results.sort(key=lambda r: (r["projected_gain"] or float("-inf")), reverse=True)
-    return results[:top_n]
+    candidate_time = time.perf_counter() - candidate_start
+
+    # ---------------------------------------------------------
+    # Sort/finalize
+    # ---------------------------------------------------------
+    sort_start = time.perf_counter()
+
+    results.sort(
+        key=lambda r: (r["projected_gain"] or float("-inf")),
+        reverse=True,
+    )
+
+    results = results[:top_n]
+
+    sort_time = time.perf_counter() - sort_start
+
+    total_time = time.perf_counter() - total_start
+
+    # ---------------------------------------------------------
+    # Benchmark output
+    # ---------------------------------------------------------
+    print("\n=== WAIVER BENCHMARK ===")
+    print(f"Free agents considered:     {len(fa_ids)}")
+    print(f"Roster players:             {len(current_ids)}")
+    print(f"Simulations:                {simulation_count}")
+    print()
+    print(f"Setup:                      {setup_time:.3f} sec")
+    print(f"Baseline simulation:        {baseline_time:.3f} sec")
+    print(f"FA prefilter:               {fa_time:.3f} sec")
+    print(f"FA player info:             {fa_info_time:.3f} sec")
+    print(f"Candidate simulations:      {simulation_time:.3f} sec")
+    print(f"Drop player info:            {drop_info_time:.3f} sec")
+    print(f"Candidate evaluation total: {candidate_time:.3f} sec")
+    print(f"Sort/finalize:              {sort_time:.3f} sec")
+    print()
+    print(f"TOTAL:                      {total_time:.3f} sec")
+    print("==========================\n")
+
+    return results
 
 
 def explain_pickup(conn, league_key: str, team_id: int, add_player_id: int, drop_player_id: int,
@@ -59,12 +185,29 @@ def explain_pickup(conn, league_key: str, team_id: int, add_player_id: int, drop
     """
     as_of_week = as_of_week or start_week
     slot_counts = repo.get_slot_counts(conn, league_key)
-    current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
+    current_ids = repo.get_roster_player_ids(
+        conn, league_key, team_id, as_of_week
+    )
 
-    before = simulate_roster(conn, league_key, current_ids, slot_counts, start_week, end_week)
+    before = simulate_roster(
+        conn,
+        league_key,
+        current_ids,
+        slot_counts,
+        start_week,
+        end_week,
+    )
 
     new_ids = [pid for pid in current_ids if pid != drop_player_id] + [add_player_id]
-    after = simulate_roster(conn, league_key, new_ids, slot_counts, start_week, end_week)
+
+    after = simulate_roster(
+        conn,
+        league_key,
+        new_ids,
+        slot_counts,
+        start_week,
+        end_week,
+    )
 
     return {
         "add": repo.get_player_info(conn, add_player_id),
