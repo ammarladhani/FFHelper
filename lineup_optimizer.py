@@ -17,15 +17,14 @@ from scipy.optimize import linear_sum_assignment
 import config
 
 BIG = 1e9  # cost for an ineligible player/slot pairing - effectively "never assign this"
-
+_SLOT_ID_CACHE = {
+    name: slot_id
+    for slot_id, name in config.SLOT_MAP.items()
+}
 
 def _slot_id(slot_name: str):
     """Return ESPN slot ID for a readable slot name."""
-    for slot_id, name in config.SLOT_MAP.items():
-        if name == slot_name:
-            return slot_id
-    return None
-
+    return _SLOT_ID_CACHE.get(slot_name)
 
 def _eligible_for_slot(player: dict, slot_name: str) -> bool:
     """

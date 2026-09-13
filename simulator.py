@@ -14,13 +14,83 @@ from lineup_optimizer import optimize_lineup
 
 
 def simulate_roster(conn, league_key: str, player_ids: list, slot_counts: dict,
-                     start_week: int, end_week: int) -> dict:
+                    start_week: int, end_week: int) -> dict:
+    if not player_ids:
+        return {
+            "weekly": {
+                week: 0.0
+                for week in range(start_week, end_week + 1)
+            },
+            "total": 0.0,
+        }
+
+    # Load player metadata once instead of once per player per week.
+    players_by_id = {}
+
+    for pid in player_ids:
+        info = repo.get_player_info(conn, pid)
+        if info:
+            players_by_id[pid] = info
+
+    valid_player_ids = list(players_by_id.keys())
+
+    if not valid_player_ids:
+        return {
+            "weekly": {
+                week: 0.0
+                for week in range(start_week, end_week + 1)
+            },
+            "total": 0.0,
+        }
+
+    # Load every projection needed for this roster in one query.
+    placeholders = ",".join("?" for _ in valid_player_ids)
+
+    rows = conn.execute(
+        f"""
+        SELECT player_id, week, projected_points
+        FROM projections
+        WHERE league_key = ?
+          AND player_id IN ({placeholders})
+          AND week BETWEEN ? AND ?
+        """,
+        (
+            league_key,
+            *valid_player_ids,
+            start_week,
+            end_week,
+        ),
+    ).fetchall()
+
+    projections = {
+        (row[0], row[1]): row[2]
+        for row in rows
+    }
+
     weekly = {}
+
     for week in range(start_week, end_week + 1):
-        players = repo.get_roster_with_projection(conn, league_key, player_ids, week)
+        players = []
+
+        for pid in valid_player_ids:
+            info = players_by_id[pid]
+
+            players.append({
+                "player_id": pid,
+                "name": info["name"],
+                "position": info["position"],
+                "eligible_slots": info["eligible_slots"],
+                "projected": projections.get((pid, week)),
+            })
+
         result = optimize_lineup(players, slot_counts)
         weekly[week] = result["total_points"]
-    return {"weekly": weekly, "total": sum(weekly.values())}
+
+    return {
+        "weekly": weekly,
+        "total": sum(weekly.values()),
+    }
+
 
 
 def simulate_team_season(conn, league_key: str, team_id: int, start_week: int,
