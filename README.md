@@ -97,6 +97,17 @@ python cli.py trade-why --league my_league \
 ```
 python cli.py trade-suggest --league my_league --team 11 --start-week 1 --end-week 18
 ```
+Add `--partner-team <team_id>` to restrict the search to one specific team instead
+of scanning the whole league:
+```
+python cli.py trade-suggest --league my_league --team 11 --partner-team 5 \
+  --start-week 1 --end-week 18
+```
+The output ends with two summary blocks - "Most frequently traded AWAY" and "Most
+frequently RECEIVED" - counted across *every* win-win trade found, not just the
+ones printed above the fold (`--top-n` only limits the printed list, not the
+summary), so it's a quick read on which of your players keep coming up as trade
+bait and which players across the league you'd keep landing on.
 
 ## How it works
 
@@ -124,8 +135,9 @@ python cli.py trade-suggest --league my_league --team 11 --start-week 1 --end-we
   add/drop combo raises the season total the most. `explain_pickup` exposes the
   week-by-week before/after behind a specific add/drop (used by `waiver-why`).
 - `trades.py` - either evaluates one specific trade you propose, or searches for
-  trades where both sides' season totals improve. `explain_trade` exposes the
-  week-by-week before/after for both teams (used by `trade-why`).
+  trades where both sides' season totals improve (optionally restricted to one
+  partner team via `partner_team_id`). `explain_trade` exposes the week-by-week
+  before/after for both teams (used by `trade-why`).
 
 ## Known rough edges / things to double check on first run
 

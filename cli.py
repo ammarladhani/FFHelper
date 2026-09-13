@@ -58,16 +58,39 @@ def cmd_trade_evaluate(args, conn):
 
 
 def cmd_trade_suggest(args, conn):
-    proposals = trades.suggest_trades(
+    all_proposals = trades.suggest_trades(
         conn, args.league, args.team, args.start_week, args.end_week,
-        as_of_week=args.as_of_week, top_n=args.top_n, candidate_prefilter=args.prefilter,
+        as_of_week=args.as_of_week, candidate_prefilter=args.prefilter,
+        partner_team_id=args.partner_team,
     )
-    print(f"\nWin-win trade suggestions for team_id={args.team}:\n")
+    proposals = all_proposals[:500]
+
+    header = f"\nWin-win trade suggestions for team_id={args.team}"
+    if args.partner_team is not None:
+        header += f" (vs team_id={args.partner_team})"
+    print(header + f" (showing {len(proposals)} of {len(all_proposals)} found):\n")
     for p in proposals:
         give_str = ", ".join(f"{x['name']} ({x['player_id']})" for x in p["give"])
         get_str = ", ".join(f"{x['name']} ({x['player_id']})" for x in p["get"])
         print(f"  Give [{give_str}]  ->  Get [{get_str}]  "
               f"(you: {p['my_delta']:+.1f}, {p['partner_team_name']}: {p['partner_delta']:+.1f})")
+
+    if all_proposals:
+        give_counts = {}
+        get_counts = {}
+        for p in all_proposals:
+            for x in p["give"]:
+                give_counts[x["name"]] = give_counts.get(x["name"], 0) + 1
+            for x in p["get"]:
+                get_counts[x["name"]] = get_counts.get(x["name"], 0) + 1
+
+        print(f"\nMost frequently traded AWAY (across all {len(all_proposals)} win-win trades found):")
+        for name, count in sorted(give_counts.items(), key=lambda kv: kv[1], reverse=True):
+            print(f"  {count:>3}x  {name}")
+
+        print(f"\nMost frequently RECEIVED (across all {len(all_proposals)} win-win trades found):")
+        for name, count in sorted(get_counts.items(), key=lambda kv: kv[1], reverse=True):
+            print(f"  {count:>3}x  {name}")
 
 
 def print_weekly_table(title, weekly_before, weekly_after):
@@ -156,6 +179,8 @@ def build_parser():
     p = sub.add_parser("trade-suggest")
     add_common(p)
     p.add_argument("--team", type=int, required=True)
+    p.add_argument("--partner-team", type=int, dest="partner_team", default=None,
+                   help="restrict search to this one other team_id instead of the whole league")
     p.add_argument("--top-n", type=int, dest="top_n", default=10)
     p.add_argument("--prefilter", type=int, default=12, help="candidates per roster side before combinatorics")
     p.set_defaults(func=cmd_trade_suggest)
