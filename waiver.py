@@ -49,3 +49,29 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
 
     results.sort(key=lambda r: (r["projected_gain"] or float("-inf")), reverse=True)
     return results[:top_n]
+
+
+def explain_pickup(conn, league_key: str, team_id: int, add_player_id: int, drop_player_id: int,
+                    start_week: int, end_week: int, as_of_week: int = None) -> dict:
+    """
+    Week-by-week comparison of a team's projected total with vs without
+    a specific add/drop, for the "why does this help" view.
+    """
+    as_of_week = as_of_week or start_week
+    slot_counts = repo.get_slot_counts(conn, league_key)
+    current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
+
+    before = simulate_roster(conn, league_key, current_ids, slot_counts, start_week, end_week)
+
+    new_ids = [pid for pid in current_ids if pid != drop_player_id] + [add_player_id]
+    after = simulate_roster(conn, league_key, new_ids, slot_counts, start_week, end_week)
+
+    return {
+        "add": repo.get_player_info(conn, add_player_id),
+        "drop": repo.get_player_info(conn, drop_player_id),
+        "weekly_before": before["weekly"],
+        "weekly_after": after["weekly"],
+        "total_before": before["total"],
+        "total_after": after["total"],
+        "delta": after["total"] - before["total"],
+    }

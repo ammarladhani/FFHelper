@@ -40,9 +40,11 @@ def cmd_waiver(args, conn):
     )
     print(f"\nTop pickups for team_id={args.team} (weeks {args.start_week}-{args.end_week}):\n")
     for r in results:
-        add_name = r["add"]["name"] if r["add"] else "?"
-        drop_name = r["drop"]["name"] if r["drop"] else "?"
-        print(f"  +{r['projected_gain']:>6.1f}  add {add_name:<22} drop {drop_name}")
+        add = r["add"]
+        drop = r["drop"]
+        add_str = f"{add['name']} ({add['player_id']})" if add else "?"
+        drop_str = f"{drop['name']} ({drop['player_id']})" if drop else "?"
+        print(f"  +{r['projected_gain']:>6.1f}  add {add_str:<32} drop {drop_str}")
 
 
 def cmd_trade_evaluate(args, conn):
@@ -62,10 +64,45 @@ def cmd_trade_suggest(args, conn):
     )
     print(f"\nWin-win trade suggestions for team_id={args.team}:\n")
     for p in proposals:
-        give_names = ", ".join(x["name"] for x in p["give"])
-        get_names = ", ".join(x["name"] for x in p["get"])
-        print(f"  Give [{give_names}]  ->  Get [{get_names}]  "
+        give_str = ", ".join(f"{x['name']} ({x['player_id']})" for x in p["give"])
+        get_str = ", ".join(f"{x['name']} ({x['player_id']})" for x in p["get"])
+        print(f"  Give [{give_str}]  ->  Get [{get_str}]  "
               f"(you: {p['my_delta']:+.1f}, {p['partner_team_name']}: {p['partner_delta']:+.1f})")
+
+
+def print_weekly_table(title, weekly_before, weekly_after):
+    print(f"\n{title}")
+    weeks = sorted(weekly_before.keys())
+    print(f"  {'Week':<6}{'Before':>10}{'After':>10}{'Diff':>10}")
+    for w in weeks:
+        b = weekly_before[w]
+        a = weekly_after.get(w, 0.0)
+        print(f"  {w:<6}{b:>10.1f}{a:>10.1f}{(a - b):>+10.1f}")
+    total_b = sum(weekly_before.values())
+    total_a = sum(weekly_after.values())
+    print(f"  {'-' * 36}")
+    print(f"  {'Total':<6}{total_b:>10.1f}{total_a:>10.1f}{(total_a - total_b):>+10.1f}")
+
+
+def cmd_waiver_why(args, conn):
+    result = waiver.explain_pickup(
+        conn, args.league, args.team, args.add, args.drop,
+        args.start_week, args.end_week, args.as_of_week,
+    )
+    add_name = result["add"]["name"] if result["add"] else "?"
+    drop_name = result["drop"]["name"] if result["drop"] else "?"
+    print_weekly_table(f"Add {add_name} / Drop {drop_name} (team_id={args.team})",
+                        result["weekly_before"], result["weekly_after"])
+
+
+def cmd_trade_why(args, conn):
+    result = trades.explain_trade(
+        conn, args.league, args.team_a, args.give, args.team_b, args.get,
+        args.start_week, args.end_week, args.as_of_week,
+    )
+    a, b = result["team_a"], result["team_b"]
+    print_weekly_table(f"Team A (id={a['team_id']})", a["weekly_before"], a["weekly_after"])
+    print_weekly_table(f"Team B (id={b['team_id']})", b["weekly_before"], b["weekly_after"])
 
 
 def build_parser():
@@ -93,6 +130,13 @@ def build_parser():
     p.add_argument("--top-n", type=int, dest="top_n", default=10)
     p.set_defaults(func=cmd_waiver)
 
+    p = sub.add_parser("waiver-why")
+    add_common(p)
+    p.add_argument("--team", type=int, required=True)
+    p.add_argument("--add", type=int, required=True, help="player_id to add")
+    p.add_argument("--drop", type=int, required=True, help="player_id to drop")
+    p.set_defaults(func=cmd_waiver_why)
+
     p = sub.add_parser("trade-evaluate")
     add_common(p)
     p.add_argument("--team-a", type=int, required=True, dest="team_a")
@@ -100,6 +144,14 @@ def build_parser():
     p.add_argument("--team-b", type=int, required=True, dest="team_b")
     p.add_argument("--get", type=int, nargs="+", required=True, help="player_id(s) team A receives")
     p.set_defaults(func=cmd_trade_evaluate)
+
+    p = sub.add_parser("trade-why")
+    add_common(p)
+    p.add_argument("--team-a", type=int, required=True, dest="team_a")
+    p.add_argument("--give", type=int, nargs="+", required=True, help="player_id(s) team A gives up")
+    p.add_argument("--team-b", type=int, required=True, dest="team_b")
+    p.add_argument("--get", type=int, nargs="+", required=True, help="player_id(s) team A receives")
+    p.set_defaults(func=cmd_trade_why)
 
     p = sub.add_parser("trade-suggest")
     add_common(p)
