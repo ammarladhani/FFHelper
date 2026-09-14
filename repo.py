@@ -65,6 +65,82 @@ def get_free_agents_ranked(conn, league_key: str, as_of_week: int, start_week: i
     return [r[0] for r in rows]
 
 
+def get_free_agents_ranked_by_position(conn, league_key: str, as_of_week: int, start_week: int,
+                                        end_week: int, limit_per_position: int = 8) -> list:
+    """
+    Free agent player_ids, ranked by naive rest-of-season projected sum
+    WITHIN each position, then the top `limit_per_position` from EVERY
+    position group are combined into one list.
+
+    This matters because a flat top-N-by-raw-points cut (get_free_agents_ranked)
+    is naturally dominated by RB/WR/QB - a mediocre bench running back
+    almost always out-projects a good kicker or streaming defense in raw
+    points, so a flat top-40 can end up never even looking at a free
+    agent K/DEF/IDP, no matter how good they are relative to their own
+    position. Ranking within each position first guarantees every
+    position gets a fair, proportionate shot at being considered - and
+    in practice lets each position use a smaller budget than a flat cut
+    would need to get the same coverage, which is a real speedup, not
+    just a fairness fix.
+    """
+    rows = conn.execute(
+        """
+        SELECT o.player_id, p.position, SUM(COALESCE(pr.projected_points, 0)) AS total
+        FROM ownership o
+        JOIN players p ON p.player_id = o.player_id
+        LEFT JOIN projections pr
+          ON pr.league_key = o.league_key
+         AND pr.player_id = o.player_id
+         AND pr.week BETWEEN ? AND ?
+        WHERE o.league_key = ? AND o.team_id IS NULL AND o.week = ?
+        GROUP BY o.player_id
+        ORDER BY p.position, total DESC
+        """,
+        (start_week, end_week, league_key, as_of_week),
+    ).fetchall()
+
+    by_position = {}
+    for pid, position, _total in rows:
+        by_position.setdefault(position, []).append(pid)
+
+    ranked = []
+    for pids in by_position.values():
+        ranked.extend(pids[:limit_per_position])
+    return ranked
+
+
+def get_roster_players_ranked_worst_first(conn, league_key: str, player_ids: list,
+                                           start_week: int, end_week: int, limit: int) -> list:
+    """
+    Given a roster's player_ids, rank them WORST first by naive sum of
+    projected points over the remaining weeks, capped to `limit`. Used to
+    narrow which of your own players are even worth testing as a "drop"
+    candidate in a waiver search - dropping a top performer for a random
+    free agent is essentially never correct, so there's no need to run
+    the expensive lineup-optimizer delta check against every single
+    roster spot, just the weakest ones.
+    """
+    if not player_ids:
+        return []
+    placeholders = ",".join("?" for _ in player_ids)
+    rows = conn.execute(
+        f"""
+        SELECT player_id, SUM(COALESCE(projected_points, 0)) AS total
+        FROM projections
+        WHERE league_key = ? AND week BETWEEN ? AND ? AND player_id IN ({placeholders})
+        GROUP BY player_id
+        ORDER BY total ASC
+        """,
+        [league_key, start_week, end_week] + player_ids,
+    ).fetchall()
+    ranked = [r[0] for r in rows]
+    # Players with no projection rows at all in this range are unknowns,
+    # not necessarily good - put them at the front (most droppable) rather
+    # than silently excluding them from consideration.
+    missing = [pid for pid in player_ids if pid not in ranked]
+    return (missing + ranked)[:limit]
+
+
 def get_player_info(conn, player_id: int) -> dict:
     row = conn.execute(
         """

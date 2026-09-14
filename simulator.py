@@ -39,6 +39,21 @@ def simulate_roster(conn, league_key: str, player_ids: list, slot_counts: dict,
     return {"weekly": weekly, "total": sum(weekly.values())}
 
 
+def get_best_lineup_for_week(conn, league_key: str, team_id: int, week: int,
+                            as_of_week: int = None) -> dict:
+    """
+    Returns the optimal starting lineup, bench, and total projected points
+    for a specific team on a given week.
+    """
+    as_of_week = as_of_week or week
+    player_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
+    if not player_ids:
+        return {"lineup": {}, "bench": [], "total_points": 0.0}
+    slot_counts = repo.get_slot_counts(conn, league_key)
+    players = repo.get_roster_with_projection(conn, league_key, player_ids, week)
+    return optimize_lineup(players, slot_counts)
+
+
 def simulate_team_season(conn, league_key: str, team_id: int, start_week: int,
                           end_week: int, as_of_week: int = None,
                           player_info_cache: dict = None, projection_cache: dict = None) -> dict:

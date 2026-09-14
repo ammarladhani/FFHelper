@@ -82,8 +82,8 @@ def _labeled_player_map(conn, player_ids):
     return labeled
 
 
-tab_standings, tab_waiver, tab_trade_finder, tab_trade_eval, tab_rosters = st.tabs(
-    ["📊 Standings", "🔄 Waiver Wire", "🤝 Trade Finder", "⚖️ Evaluate Trade", "📋 Rosters"]
+tab_standings, tab_waiver, tab_trade_finder, tab_trade_eval, tab_rosters, tab_best_lineup = st.tabs(
+    ["📊 Standings", "🔄 Waiver Wire", "🤝 Trade Finder", "⚖️ Evaluate Trade", "📋 Rosters", "🏆 Best Lineup"]
 )
 
 # ------------------------------------------------------------- standings
@@ -99,55 +99,396 @@ with tab_standings:
             {"Team": r["team_name"], "Manager": r["manager_name"], "Projected Total": round(r["total"], 1)}
             for _, r in rows
         ])
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
         st.bar_chart(df.set_index("Team")["Projected Total"])
 
 # ---------------------------------------------------------------- waiver
 
 with tab_waiver:
-    st.subheader(f"Best pickups for {my_team_label}")
-    st.caption("Tries every free agent against every roster spot on your team and ranks the best add/drop combos.")
-    col1, col2 = st.columns(2)
-    top_n = col1.slider("How many to show", 5, 50, 15, key="waiver_topn")
-    fa_prefilter = col2.slider(
-        "Free agents considered", 10, 100, 40, key="waiver_prefilter",
-        help="Only the top N free agents by raw projected points are tested in depth. Higher = more thorough but slower.",
+    st.subheader(f"Best waiver moves for {my_team_label}")
+    st.caption(
+        "Searches for waiver moves that increase your team's projected "
+        "optimized season total."
     )
 
-    if st.button("Find pickups", key="waiver_btn"):
-        with st.spinner("Testing every free agent against every roster spot..."):
-            picks = waiver.best_pickups(
-                conn, league, my_team_id, start_week, end_week,
-                top_n=top_n, fa_prefilter=fa_prefilter,
-            )
-        st.session_state["waiver_picks"] = picks
+    # ---------------------------------------------------------
+    # Search settings
+    # ---------------------------------------------------------
+    c1, c2 = st.columns(2)
 
-    picks = st.session_state.get("waiver_picks", [])
-    if not picks:
-        st.info("Click 'Find pickups' to search.")
-    for i, p in enumerate(picks):
-        add, drop = p["add"], p["drop"]
-        add_name = add["name"] if add else "?"
-        drop_name = drop["name"] if drop else "?"
-        c1, c2, c3 = st.columns([3, 3, 1])
-        c1.write(f"**Add:** {add_name}")
-        c2.write(f"**Drop:** {drop_name}")
-        c3.metric("Gain", f"+{p['projected_gain']:.1f}")
-        with st.expander("Why does this help? (week by week)"):
-            if add and drop:
-                explanation = waiver.explain_pickup(
-                    conn, league, my_team_id, add["player_id"], drop["player_id"],
-                    start_week, end_week,
+    top_n = c1.slider(
+        "Show top N",
+        5,
+        100,
+        10,
+        key="waiver_topn",
+    )
+
+    fa_prefilter = c2.slider(
+        "Top free agents per position",
+        2,
+        30,
+        8,
+        key="waiver_prefilter",
+        help=(
+            "Takes the top N free agents within each position based "
+            "on projected points. This prevents positions such as "
+            "K/DEF/IDP from being crowded out by higher-scoring QB/RB/WR."
+        ),
+    )
+
+    search_2_for_2 = st.checkbox(
+        "Also search 2-for-2 waivers (much slower)",
+        value=False,
+        key="waiver_2_for_2",
+        help=(
+            "Off = 1-for-1 waivers only. On = also searches combinations "
+            "where you add two free agents and drop two players."
+        ),
+    )
+
+    if search_2_for_2:
+        c1, c2 = st.columns(2)
+
+        waiver_2drop_prefilter = c1.slider(
+            "2-for-2 drop candidates",
+            4,
+            20,
+            10,
+            key="waiver_2drop_prefilter",
+            help=(
+                "Lowest-projected players on your roster considered "
+                "as possible drops."
+            ),
+        )
+
+        # Show an estimate of the 2-for-2 search size.
+        #
+        # get_free_agents_ranked_by_position() returns up to N players
+        # per position, so this is an estimate based on five position
+        # groups. The actual number depends on your league.
+        estimated_fa_count = fa_prefilter * 5
+
+        estimated_fa_pairs = (
+            estimated_fa_count
+            * (estimated_fa_count - 1)
+            // 2
+        )
+
+        estimated_drop_pairs = (
+            waiver_2drop_prefilter
+            * (waiver_2drop_prefilter - 1)
+            // 2
+        )
+
+        estimated_combinations = (
+            estimated_fa_pairs
+            * estimated_drop_pairs
+        )
+
+        c2.metric(
+            "Estimated 2-for-2 searches",
+            f"{estimated_combinations:,}",
+        )
+
+    # ---------------------------------------------------------
+    # Search
+    # ---------------------------------------------------------
+    if st.button("Find pickups", key="waiver_btn"):
+
+        # -----------------------------------------------------
+        # 1-for-1
+        # -----------------------------------------------------
+        with st.spinner(
+            "Searching for best 1-for-1 waiver moves..."
+        ):
+            waiver_picks = waiver.best_pickups(
+                conn,
+                league,
+                my_team_id,
+                start_week,
+                end_week,
+                top_n=top_n,
+                fa_prefilter=fa_prefilter,
+            )
+
+        st.session_state["waiver_picks"] = waiver_picks
+
+        # -----------------------------------------------------
+        # 2-for-2
+        # -----------------------------------------------------
+        if search_2_for_2:
+            with st.spinner(
+                "Searching for best 2-for-2 waiver moves..."
+            ):
+                waiver_2_for_2_picks = waiver.best_pickups_2_for_2(
+                    conn,
+                    league,
+                    my_team_id,
+                    start_week,
+                    end_week,
+                    top_n=top_n,
+                    fa_prefilter=fa_prefilter,
+                    drop_prefilter=waiver_2drop_prefilter,
                 )
-                weeks = sorted(explanation["weekly_before"].keys())
+
+            st.session_state["waiver_2_for_2_picks"] = (
+                waiver_2_for_2_picks
+            )
+        else:
+            st.session_state["waiver_2_for_2_picks"] = []
+
+    # ---------------------------------------------------------
+    # Results
+    # ---------------------------------------------------------
+    waiver_picks = st.session_state.get(
+        "waiver_picks",
+        [],
+    )
+
+    waiver_2_for_2_picks = st.session_state.get(
+        "waiver_2_for_2_picks",
+        [],
+    )
+
+    if not waiver_picks and not waiver_2_for_2_picks:
+        st.info("Click 'Find pickups' to search.")
+
+    # ---------------------------------------------------------
+    # 1-for-1 results
+    # ---------------------------------------------------------
+    if waiver_picks:
+        st.write("### 1-for-1 Waivers")
+
+        st.caption(
+            f"Showing {len(waiver_picks)} best 1-for-1 waiver moves"
+        )
+
+        for i, p in enumerate(waiver_picks):
+            add = p["add"]
+            drop = p["drop"]
+
+            add_name = add["name"] if add else "?"
+            drop_name = drop["name"] if drop else "?"
+
+            c1, c2, c3 = st.columns([4, 4, 1])
+
+            c1.write(f"**Add:** {add_name}")
+            c2.write(f"**Drop:** {drop_name}")
+            c3.metric(
+                "Gain",
+                f"+{p['projected_gain']:.1f}",
+            )
+
+            with st.expander(
+                "Why does this help? (week by week)",
+                key=f"waiver_explain_{i}",
+            ):
+                if add and drop:
+                    explanation = waiver.explain_pickup(
+                        conn,
+                        league,
+                        my_team_id,
+                        add["player_id"],
+                        drop["player_id"],
+                        start_week,
+                        end_week,
+                    )
+
+                    weeks = sorted(
+                        explanation["weekly_before"].keys()
+                    )
+
+                    chart_df = pd.DataFrame({
+                        "Week": weeks,
+                        "Before": [
+                            explanation["weekly_before"][w]
+                            for w in weeks
+                        ],
+                        "After": [
+                            explanation["weekly_after"][w]
+                            for w in weeks
+                        ],
+                    }).set_index("Week")
+
+                    st.line_chart(chart_df)
+
+                    st.dataframe(
+                        chart_df.reset_index(),
+                        hide_index=True,
+                        width="stretch",
+                    )
+
+    # ---------------------------------------------------------
+    # 2-for-2 results
+    # ---------------------------------------------------------
+    if waiver_2_for_2_picks:
+        st.write("### 2-for-2 Waivers")
+
+        st.caption(
+            f"Showing {len(waiver_2_for_2_picks)} best 2-for-2 "
+            "waiver moves"
+        )
+
+        for i, p in enumerate(waiver_2_for_2_picks):
+            add_players = p["add"]
+            drop_players = p["drop"]
+
+            add_str = ", ".join(
+                x["name"]
+                for x in add_players
+                if x
+            )
+
+            drop_str = ", ".join(
+                x["name"]
+                for x in drop_players
+                if x
+            )
+
+            c1, c2, c3 = st.columns([4, 4, 1])
+
+            c1.write(f"**Add:** {add_str}")
+            c2.write(f"**Drop:** {drop_str}")
+            c3.metric(
+                "Gain",
+                f"+{p['projected_gain']:.1f}",
+            )
+
+            with st.expander(
+                "Why does this help? (week by week)",
+                key=f"waiver_2for2_explain_{i}",
+            ):
+                explanation = waiver.explain_pickup_2_for_2(
+                    conn,
+                    league,
+                    my_team_id,
+                    [
+                        x["player_id"]
+                        for x in add_players
+                        if x
+                    ],
+                    [
+                        x["player_id"]
+                        for x in drop_players
+                        if x
+                    ],
+                    start_week,
+                    end_week,
+                )
+
+                weeks = sorted(
+                    explanation["weekly_before"].keys()
+                )
+
                 chart_df = pd.DataFrame({
                     "Week": weeks,
-                    "Before": [explanation["weekly_before"][w] for w in weeks],
-                    "After": [explanation["weekly_after"][w] for w in weeks],
+                    "Before": [
+                        explanation["weekly_before"][w]
+                        for w in weeks
+                    ],
+                    "After": [
+                        explanation["weekly_after"][w]
+                        for w in weeks
+                    ],
                 }).set_index("Week")
+
                 st.line_chart(chart_df)
-                st.dataframe(chart_df.reset_index(), hide_index=True, use_container_width=True)
+
+                st.dataframe(
+                    chart_df.reset_index(),
+                    hide_index=True,
+                    width="stretch",
+                )
+
+    # ---------------------------------------------------------
+    # Frequency charts
+    # ---------------------------------------------------------
+    if waiver_picks:
         st.divider()
+
+        st.write("### 1-for-1 Waiver Trends")
+
+        give_counts = {}
+        drop_counts = {}
+
+        for p in waiver_picks:
+            add = p["add"]
+            drop = p["drop"]
+
+            if add:
+                give_counts[add["name"]] = (
+                    give_counts.get(add["name"], 0) + 1
+                )
+
+            if drop:
+                drop_counts[drop["name"]] = (
+                    drop_counts.get(drop["name"], 0) + 1
+                )
+
+        colA, colB = st.columns(2)
+
+        with colA:
+            st.write("**Most frequently ADDED**")
+
+            if give_counts:
+                st.bar_chart(
+                    pd.Series(give_counts)
+                    .sort_values(ascending=False)
+                )
+
+        with colB:
+            st.write("**Most frequently DROPPED**")
+
+            if drop_counts:
+                st.bar_chart(
+                    pd.Series(drop_counts)
+                    .sort_values(ascending=False)
+                )
+
+    if waiver_2_for_2_picks:
+        st.divider()
+
+        st.write("### 2-for-2 Waiver Trends")
+
+        add_counts = {}
+        drop_counts = {}
+
+        for p in waiver_2_for_2_picks:
+            for player in p["add"]:
+                if player:
+                    name = player["name"]
+                    add_counts[name] = (
+                        add_counts.get(name, 0) + 1
+                    )
+
+            for player in p["drop"]:
+                if player:
+                    name = player["name"]
+                    drop_counts[name] = (
+                        drop_counts.get(name, 0) + 1
+                    )
+
+        colA, colB = st.columns(2)
+
+        with colA:
+            st.write("**Most frequently ADDED**")
+
+            if add_counts:
+                st.bar_chart(
+                    pd.Series(add_counts)
+                    .sort_values(ascending=False)
+                )
+
+        with colB:
+            st.write("**Most frequently DROPPED**")
+
+            if drop_counts:
+                st.bar_chart(
+                    pd.Series(drop_counts)
+                    .sort_values(ascending=False)
+                )
+
 
 # ---------------------------------------------------------- trade finder
 
@@ -162,10 +503,10 @@ with tab_trade_finder:
 
     c1, c2 = st.columns(2)
     prefilter = c1.slider(
-        "Search depth (prefilter)", 4, 16, 12, key="trade_prefilter",
+        "Search depth (prefilter)", 4, 23, 12, key="trade_prefilter",
         help="Only the top N players per roster (by raw projected points) are considered as trade pieces.",
     )
-    top_n = c2.slider("Show top N", 5, 50, 10, key="trade_topn")
+    top_n = c2.slider("Show top N", 5, 1000, 10, key="trade_topn")
 
     deep_search = st.checkbox(
         "Also search 2-for-2 trades (much slower)",
@@ -283,4 +624,54 @@ with tab_rosters:
             {"Name": p["name"], "Position": p["position"], "Projected": p["projected"]}
             for p in players
         ]).sort_values("Projected", ascending=False, na_position="last")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
+
+# ---------------------------------------------------------- best lineup / roster
+
+with tab_best_lineup:
+    st.subheader("Optimal Lineup by Week")
+    st.caption("View any team's highest-projected starting lineup and bench for a given week.")
+
+    col_t, col_w = st.columns(2)
+    best_team_label = col_t.selectbox("Team", label_list, index=default_index, key="best_team_select")
+    best_team_id = team_labels[best_team_label]
+    best_week = col_w.number_input("Week", min_value=1, max_value=18, value=start_week, key="best_week_select")
+
+    best_result = simulator.get_best_lineup_for_week(conn, league, best_team_id, int(best_week))
+
+    if not best_result["lineup"] and not best_result["bench"]:
+        st.info("No roster data available for this team and week.")
+    else:
+        st.metric("Optimal Lineup Projected Points", f"{best_result['total_points']:.2f}")
+
+        st.write("### 🏈 Starting Lineup")
+        starter_rows = []
+        for slot_name, players_assigned in best_result["lineup"].items():
+            for p in players_assigned:
+                starter_rows.append({
+                    "Slot": slot_name,
+                    "Name": p["name"],
+                    "Position": p["position"],
+                    "Projected Points": round(p["projected"], 2) if p.get("projected") is not None else 0.0,
+                })
+
+        if starter_rows:
+            df_starters = pd.DataFrame(starter_rows)
+            st.dataframe(df_starters, width="stretch", hide_index=True)
+        else:
+            st.write("No starters assigned.")
+
+        st.write("### 🪑 Bench")
+        bench_rows = [
+            {
+                "Name": p["name"],
+                "Position": p["position"],
+                "Projected Points": round(p.get("projected") or 0.0, 2),
+            }
+            for p in best_result["bench"]
+        ]
+        if bench_rows:
+            df_bench = pd.DataFrame(bench_rows).sort_values("Projected Points", ascending=False)
+            st.dataframe(df_bench, width="stretch", hide_index=True)
+        else:
+            st.write("No bench players.")

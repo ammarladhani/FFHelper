@@ -99,5 +99,12 @@ def optimize_lineup(players: list, slot_counts: dict) -> dict:
             total_points += player["projected"]
 
     bench = [p for p in pool if p["player_id"] not in assigned_ids]
+    bench = sorted(bench, key=lambda x: (x.get("projected") or 0.0), reverse=True)
 
-    return {"lineup": lineup, "bench": bench, "total_points": total_points}
+    # Sort lineup slot keys by intuitive football order (QB, RB, WR, TE, FLEX, K, D/ST, ...)
+    sorted_slots = sorted(lineup.keys(), key=config.slot_sort_key)
+    sorted_lineup = {}
+    for s in sorted_slots:
+        sorted_lineup[s] = sorted(lineup[s], key=lambda x: (x.get("projected") or 0.0), reverse=True)
+
+    return {"lineup": sorted_lineup, "bench": bench, "total_points": total_points}

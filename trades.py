@@ -13,7 +13,7 @@ the combinatorics sane - see `candidate_prefilter`.
 """
 
 from itertools import combinations
-
+import math
 import repo
 from simulator import simulate_roster
 
@@ -145,7 +145,7 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
                         "partner_delta": partner_delta,
                     })
 
-    proposals.sort(key=lambda p: p["my_delta"], reverse=True)
+    proposals.sort(key=lambda p: math.sqrt(p["my_delta"] * p["partner_delta"]), reverse=True)
     return proposals
 
 

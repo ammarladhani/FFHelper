@@ -51,7 +51,7 @@ SLOT_MAP = {
 POSITION_MAP = {
     1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "D/ST",
     # IDP positions
-    8: "DT", 9: "DE", 10: "LB", 11: "DL", 12: "CB", 13: "S",
+    9: "DT", 10: "DE", 11: "LB", 12: "CB", 13: "S",
     14: "DB", 15: "DP", 7: "P",
 }
 
@@ -71,3 +71,17 @@ FLEX_SLOT_ELIGIBILITY = {
 
 # Slot names that never count toward a team's scoring lineup.
 NON_STARTING_SLOTS = {"BE", "BN", "IR", ""}
+
+# Preferred display ordering for lineup slots (QB, RB, WR, TE, FLEX, K, DEF, IDPs, ...)
+PREFERRED_SLOT_ORDER = [
+    "QB", "TQB", "RB", "RB/WR", "WR", "WR/TE", "TE",
+    "FLEX", "OP", "SUPER_FLEX", "K", "D/ST", "DEF", "P", "HC",
+    "DT", "DE", "DL", "LB", "CB", "S", "DB", "DP", "EDR", "Rookie",
+]
+
+
+def slot_sort_key(slot_name: str) -> int:
+    try:
+        return PREFERRED_SLOT_ORDER.index(slot_name)
+    except ValueError:
+        return 999

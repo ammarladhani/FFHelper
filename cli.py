@@ -128,6 +128,20 @@ def cmd_trade_why(args, conn):
     print_weekly_table(f"Team B (id={b['team_id']})", b["weekly_before"], b["weekly_after"])
 
 
+def cmd_best_lineup(args, conn):
+    result = simulator.get_best_lineup_for_week(conn, args.league, args.team, args.week, as_of_week=args.as_of_week)
+    print(f"\nBest roster for team_id={args.team} in week {args.week} (Total: {result['total_points']:.2f}):\n")
+    print("STARTING LINEUP:")
+    for slot_name, players in result["lineup"].items():
+        for p in players:
+            pts = f"{p['projected']:.2f}" if p.get("projected") is not None else "N/A"
+            print(f"  {slot_name:<6} {p['name']:<25} ({p['position']}) - {pts} pts")
+    print("\nBENCH:")
+    for p in result["bench"]:
+        pts = f"{p['projected']:.2f}" if p.get("projected") is not None else "N/A"
+        print(f"  BN     {p['name']:<25} ({p['position']}) - {pts} pts")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Fantasy football optimizer")
     parser.add_argument("--db", default=config.DB_PATH)
@@ -184,6 +198,13 @@ def build_parser():
     p.add_argument("--top-n", type=int, dest="top_n", default=10)
     p.add_argument("--prefilter", type=int, default=12, help="candidates per roster side before combinatorics")
     p.set_defaults(func=cmd_trade_suggest)
+
+    p = sub.add_parser("best-lineup")
+    p.add_argument("--league", required=True)
+    p.add_argument("--team", type=int, required=True)
+    p.add_argument("--week", type=int, required=True)
+    p.add_argument("--as-of-week", type=int, dest="as_of_week", default=None)
+    p.set_defaults(func=cmd_best_lineup)
 
     return parser
 
