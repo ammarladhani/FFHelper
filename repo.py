@@ -112,24 +112,55 @@ def get_roster_with_projection(
     player_ids: list,
     week: int,
 ) -> list:
-    """Build player dicts for the lineup optimizer."""
+    """Build player dicts for the lineup optimizer - one batched query for
+    player info, one for that week's projections, instead of two queries
+    PER PLAYER. This function gets called once per week inside every
+    simulate_roster call, which itself gets called many times over by
+    waiver/trade search - the per-player query pattern was the single
+    biggest cost multiplier in the whole system."""
+    if not player_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in player_ids)
+
+    player_rows = conn.execute(
+        f"""
+        SELECT player_id, name, position, eligible_slots
+        FROM players
+        WHERE player_id IN ({placeholders})
+        """,
+        player_ids,
+    ).fetchall()
+
+    info_map = {}
+    for pid, name, position, eligible_slots_json in player_rows:
+        try:
+            eligible_slots = json.loads(eligible_slots_json) if eligible_slots_json else []
+        except (TypeError, json.JSONDecodeError):
+            eligible_slots = []
+        info_map[pid] = {"name": name, "position": position, "eligible_slots": eligible_slots}
+
+    proj_rows = conn.execute(
+        f"""
+        SELECT player_id, projected_points
+        FROM projections
+        WHERE league_key = ? AND week = ? AND player_id IN ({placeholders})
+        """,
+        [league_key, week] + player_ids,
+    ).fetchall()
+    proj_map = {pid: pts for pid, pts in proj_rows}
+
     players = []
-
     for pid in player_ids:
-        info = get_player_info(conn, pid)
-
+        info = info_map.get(pid)
         if not info:
             continue
-
-        proj = get_projection(conn, league_key, pid, week)
-
         players.append({
             "player_id": pid,
             "name": info["name"],
             "position": info["position"],
             "eligible_slots": info["eligible_slots"],
-            "projected": proj,
+            "projected": proj_map.get(pid),
         })
 
     return players
-

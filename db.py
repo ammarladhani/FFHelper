@@ -55,7 +55,12 @@ CREATE TABLE IF NOT EXISTS ownership (
 
 
 def get_conn(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    # check_same_thread=False: Streamlit's caching/rerun model can execute
+    # a cached resource (like this connection) from a different thread
+    # than the one that created it. This app only ever does one thing at
+    # a time per connection (no real concurrent access), so relaxing
+    # SQLite's default same-thread check is safe here.
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 

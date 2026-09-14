@@ -9,12 +9,14 @@ Pulls fantasy football projections + rosters (ESPN and/or Sleeper), then answers
 - *Why* does a given pickup or trade help - week by week, before vs after?
 
 Supports multiple leagues at once, across platforms - e.g. an ESPN IDP league and a
-separate Sleeper league, tracked side by side in the same local database.
+separate Sleeper league, tracked side by side in the same local database. Usable
+either as a CLI (`cli.py`) or a local web UI (`app.py`) - both call the same
+backend, so pick whichever fits the moment.
 
 ## Setup
 
 ```
-pip install requests scipy
+pip install requests scipy streamlit pandas
 ```
 
 Edit `config.py`. Each entry in `LEAGUES` needs a `"platform"` key:
@@ -51,6 +53,31 @@ python cli.py list-teams --league sleeper_league
 
 Fill those into `config.py`'s `my_team_id` if you want, or just pass `--team` on the
 command line each time.
+
+## Web UI
+
+```
+streamlit run app.py
+```
+
+Opens a local dashboard in your browser (defaults to `http://localhost:8501`).
+Pick a league and team from the sidebar, then:
+
+- **Standings** - projected remaining-season totals for every team, with a chart.
+- **Waiver Wire** - top pickups, with an expandable "why does this help?" panel per
+  pickup showing a week-by-week before/after chart (same as `waiver-why`, but
+  inline, no need to copy player IDs by hand).
+- **Trade Finder** - win-win trades, with a dropdown to restrict to one partner
+  team (same as `--partner-team`), plus the give/get frequency charts.
+- **Evaluate Trade** - pick players from dropdowns instead of typing IDs; shows
+  before/after totals and a chart for both teams.
+- **Rosters** - browse any team's roster and projections for a given week.
+
+This is a thin layer over the same `simulator` / `waiver` / `trades` / `repo`
+modules the CLI uses - nothing about the underlying logic changes, it's just a
+friendlier way to drive it (and you don't need to hunt down player IDs by hand
+for `waiver-why` / `trade-evaluate` / `trade-why` anymore, since the UI looks
+them up via dropdowns).
 
 ## Commands
 

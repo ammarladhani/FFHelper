@@ -46,7 +46,7 @@ def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
 
 def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_week: int,
                     as_of_week: int = None, candidate_prefilter: int = 12,
-                    combo_sizes=(1,2), partner_team_id: int = None) -> list:
+                    combo_sizes=(1,2,), partner_team_id: int = None) -> list:
     """
     Search win-win 1-for-1 (and optionally larger, via combo_sizes)
     trades between my_team_id and every other team in the league - or,
@@ -59,14 +59,24 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
     by naive rest-of-season projected sum before generating trade
     combinations, since full combinatorics over a ~15-man roster on
     both sides explodes quickly.
+
+    Performance note: each team's "no trade happened" baseline total is
+    computed ONCE (not once per candidate combo, which is what a naive
+    call to evaluate_trade() in a loop would do) - and if a combo
+    doesn't even help your own team, the partner's side is never
+    simulated at all. Both cuts were the dominant cost here, since a
+    full season simulation runs the lineup optimizer for every week.
     """
     as_of_week = as_of_week or start_week
+    slot_counts = repo.get_slot_counts(conn, league_key)
+
     teams = repo.get_teams(conn, league_key)
     if partner_team_id is not None:
         teams = [t for t in teams if t["team_id"] == partner_team_id]
 
     my_ids_full = repo.get_roster_player_ids(conn, league_key, my_team_id, as_of_week)
     my_candidates = _top_players_by_rest_of_season(conn, league_key, my_ids_full, start_week, end_week, candidate_prefilter)
+    my_baseline = simulate_roster(conn, league_key, my_ids_full, slot_counts, start_week, end_week)["total"]
 
     proposals = []
 
@@ -77,38 +87,59 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
 
         other_ids_full = repo.get_roster_player_ids(conn, league_key, other_id, as_of_week)
         other_candidates = _top_players_by_rest_of_season(conn, league_key, other_ids_full, start_week, end_week, candidate_prefilter)
+        other_baseline = simulate_roster(conn, league_key, other_ids_full, slot_counts, start_week, end_week)["total"]
 
         for size in combo_sizes:
             for my_combo in combinations(my_candidates, size):
+                new_a_ids = [pid for pid in my_ids_full if pid not in my_combo]
+
                 for other_combo in combinations(other_candidates, size):
-                    result = evaluate_trade(
-                        conn, league_key, my_team_id, list(my_combo),
-                        other_id, list(other_combo), start_week, end_week, as_of_week,
-                    )
-                    if result["team_a"]["delta"] > 0 and result["team_b"]["delta"] > 0:
-                        proposals.append({
-                            "give": [repo.get_player_info(conn, pid) for pid in my_combo],
-                            "get": [repo.get_player_info(conn, pid) for pid in other_combo],
-                            "partner_team_id": other_id,
-                            "partner_team_name": team["team_name"],
-                            "my_delta": result["team_a"]["delta"],
-                            "partner_delta": result["team_b"]["delta"],
-                        })
+                    trial_a_ids = new_a_ids + list(other_combo)
+                    new_a_total = simulate_roster(conn, league_key, trial_a_ids, slot_counts, start_week, end_week)["total"]
+                    my_delta = round(new_a_total - my_baseline, 2)
+                    if my_delta <= 0:
+                        continue  # doesn't even help me - skip the pricier partner-side check
+
+                    new_b_ids = [pid for pid in other_ids_full if pid not in other_combo] + list(my_combo)
+                    new_b_total = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week)["total"]
+                    partner_delta = round(new_b_total - other_baseline, 2)
+                    if partner_delta <= 0:
+                        continue
+
+                    proposals.append({
+                        "give": [repo.get_player_info(conn, pid) for pid in my_combo],
+                        "get": [repo.get_player_info(conn, pid) for pid in other_combo],
+                        "partner_team_id": other_id,
+                        "partner_team_name": team["team_name"],
+                        "my_delta": my_delta,
+                        "partner_delta": partner_delta,
+                    })
 
     proposals.sort(key=lambda p: p["my_delta"], reverse=True)
     return proposals
 
 
 def _top_players_by_rest_of_season(conn, league_key, player_ids, start_week, end_week, limit):
-    scored = []
-    for pid in player_ids:
-        total = 0.0
-        for week in range(start_week, end_week + 1):
-            proj = repo.get_projection(conn, league_key, pid, week)
-            total += proj or 0.0
-        scored.append((pid, total))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [pid for pid, _ in scored[:limit]]
+    if not player_ids:
+        return []
+    placeholders = ",".join("?" for _ in player_ids)
+    rows = conn.execute(
+        f"""
+        SELECT player_id, SUM(COALESCE(projected_points, 0)) AS total
+        FROM projections
+        WHERE league_key = ? AND week BETWEEN ? AND ? AND player_id IN ({placeholders})
+        GROUP BY player_id
+        ORDER BY total DESC
+        """,
+        [league_key, start_week, end_week] + player_ids,
+    ).fetchall()
+    ranked = [r[0] for r in rows]
+    # Any player with literally no projection rows at all in this range
+    # (shouldn't normally happen - ingestion writes a row every week even
+    # when the value is None) won't appear in the GROUP BY result; tack
+    # them on at the bottom rather than silently dropping them.
+    missing = [pid for pid in player_ids if pid not in ranked]
+    return (ranked + missing)[:limit]
 
 
 def explain_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
