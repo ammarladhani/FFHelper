@@ -183,6 +183,7 @@ def main():
         platform = league_cfg.get("platform", "espn")
 
         if platform == "espn":
+            config.require_espn_credentials()
             ingest_espn_league_settings(conn, league_cfg, league_key, config.SEASON)
             for week in range(config.START_WEEK, config.END_WEEK + 1):
                 ingest_espn_week(conn, league_cfg, league_key, config.SEASON, week)

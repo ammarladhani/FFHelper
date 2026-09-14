@@ -16,16 +16,18 @@ backend, so pick whichever fits the moment.
 ## Setup
 
 ```
-pip install requests scipy streamlit pandas
+pip install -r requirements.txt
 ```
 
-Edit `config.py`. Each entry in `LEAGUES` needs a `"platform"` key:
+Copy `.env.example` to `.env` and fill in your ESPN session cookies (pull fresh
+from browser dev tools: Network tab -> any fantasy.espn.com request -> Cookies).
+**These are live credentials for your ESPN account - `.env` is gitignored and
+should never be committed.** `config.py` itself has no secrets in it and is safe
+to share/commit.
 
-- **ESPN**: fill in `swid` and `espn_s2` (pull fresh from browser dev tools:
-  Network tab -> any fantasy.espn.com request -> Cookies).
-- **Sleeper**: fill in `league_id` only (from the URL when viewing your league on
-  sleeper.com, e.g. `sleeper.com/leagues/<LEAGUE_ID>`). Sleeper's read API is fully
-  public - no cookies or login needed at all.
+Sleeper leagues need only a `league_id` in `config.py` (from the URL when
+viewing your league on sleeper.com, e.g. `sleeper.com/leagues/<LEAGUE_ID>`) -
+Sleeper's read API is fully public, no cookies or login needed at all.
 
 Leave `my_team_id` as `None` for now - you'll fill it in after the first run.
 
@@ -37,12 +39,13 @@ python ingest.py
 
 This pulls every week's projections + ownership + league settings + player slot
 eligibility into a local SQLite file (`fantasy.db`), for every league listed in
-`config.py`. It'll take a few minutes per league for a full season.
+`config.py`. It'll take a few minutes per league for a full season. `fantasy.db`
+is gitignored - it's derived data, regenerate it locally rather than committing it.
 
 > If you're upgrading from a version of this tool from before Sleeper support: the
 > database schema changed (`player_id` is now text instead of a number, since
 > Sleeper uses string IDs - even non-numeric ones like `"BUF"` for a defense).
-> Delete your existing `fantasy.db` and re-run `ingest.py` fresh.
+> Run `python reset_db.py` and then `python ingest.py` fresh.
 
 Then find your team ID for each league:
 
@@ -75,9 +78,9 @@ Pick a league and team from the sidebar, then:
 
 This is a thin layer over the same `simulator` / `waiver` / `trades` / `repo`
 modules the CLI uses - nothing about the underlying logic changes, it's just a
-friendlier way to drive it (and you don't need to hunt down player IDs by hand
-for `waiver-why` / `trade-evaluate` / `trade-why` anymore, since the UI looks
-them up via dropdowns).
+friendlier way to drive it. Cached results (waiver picks, trade proposals) are
+keyed by league/team/week-range, so switching teams in the sidebar won't leave
+stale results from the previous team on screen under the new team's label.
 
 ## Commands
 
@@ -136,15 +139,32 @@ ones printed above the fold (`--top-n` only limits the printed list, not the
 summary), so it's a quick read on which of your players keep coming up as trade
 bait and which players across the league you'd keep landing on.
 
+## Tests
+
+```
+python -m pytest tests/ -v
+```
+
+Builds a small in-memory league and exercises `simulator`, `waiver`, and `trades`
+end to end. There were previously no tests at all in this repo, which is how a
+signature mismatch between `waiver.py`'s calls to `simulate_roster()` and
+`simulator.py`'s actual `simulate_roster()` definition shipped - every single
+`python cli.py waiver` invocation raised `TypeError`. Run this before opening a PR
+that touches `simulator.py`, `repo.py`, `waiver.py`, or `trades.py`.
+
 ## How it works
 
 - `espn_client.py` / `sleeper_client.py` - talk to each platform's API. ESPN needs
-  auth cookies; Sleeper is public read-only. Both normalize into the same shape
-  before hitting the database.
+  auth cookies (from `.env`, see Setup); Sleeper is public read-only. Both
+  normalize into the same shape before hitting the database.
 - `db.py` / `repo.py` - SQLite storage and read queries. Player IDs are stored
   prefixed by platform (`espn_4046692`, `sleeper_4984`) since the two platforms use
   completely separate, non-comparable ID spaces - without the prefix, an ID could
   theoretically collide between an ESPN player and an unrelated Sleeper player.
+  `repo.py`'s player-info/roster lookups accept an optional shared cache dict so
+  `waiver.py`/`trades.py` searches (which re-simulate the same handful of players
+  over and over across candidate rosters) don't round-trip to SQLite for
+  information that hasn't changed between calls.
 - Player slot eligibility (`eligible_slots`) is stored as a list of **slot name
   strings** (e.g. `["DT", "DL", "DP", "BE"]`), not platform-specific numeric codes -
   this is what lets one `lineup_optimizer.py` work for both platforms. ESPN's
@@ -161,10 +181,21 @@ bait and which players across the league you'd keep landing on.
 - `waiver.py` - tries every free agent against every roster spot, keeps whichever
   add/drop combo raises the season total the most. `explain_pickup` exposes the
   week-by-week before/after behind a specific add/drop (used by `waiver-why`).
+  Free agents are pre-filtered to the top `fa_prefilter` (default 40, matching this
+  doc - a prior default of 2533 effectively disabled the prefilter) before the
+  expensive per-candidate simulation runs.
 - `trades.py` - either evaluates one specific trade you propose, or searches for
   trades where both sides' season totals improve (optionally restricted to one
   partner team via `partner_team_id`). `explain_trade` exposes the week-by-week
-  before/after for both teams (used by `trade-why`).
+  before/after for both teams (used by `trade-why`). `suggest_trades` defaults to
+  1-for-1 swaps only (`combo_sizes=(1,)`); pass `combo_sizes=(1, 2)` for
+  2-for-1/2-for-2 too, with a smaller `candidate_prefilter` since it's much slower.
+- `inspect_db.py` - read-only schema/data inspector:
+  `python inspect_db.py fantasy.db --team 11 --player "some name"`.
+- `reset_db.py` - safely deletes `fantasy.db` (with a confirmation prompt) so you
+  can rebuild it from scratch after a schema change.
+- `debug_sleeper_projections.py` - probes Sleeper's unofficial projections
+  endpoint if `sleeper_client.py`'s parsing ever starts breaking (see below).
 
 ## Known rough edges / things to double check on first run
 
@@ -175,7 +206,10 @@ bait and which players across the league you'd keep landing on.
   empty), that's the first place to look. A player's `position` and their
   `eligible_slots` are two different things pulled from two different ESPN
   fields - don't assume a slot name matching a player's nominal position is
-  the only way they can be eligible for it.
+  the only way they can be eligible for it. `espn_client.py` now raises instead
+  of silently returning a partial/empty player list on an ESPN error response
+  (most commonly an expired SWID/espn_s2 cookie) - check the exception message
+  first if ingestion suddenly stops finding anyone.
 - Sleeper's projections come from an **unofficial, undocumented endpoint**
   (discovered by probing - see `sleeper_client.py`'s docstring). If Sleeper ever
   changes this, `debug_sleeper_projections.py` is the script to re-run to find the
@@ -191,9 +225,3 @@ bait and which players across the league you'd keep landing on.
   by the player's own position rather than `eligible_slots`, since these are league
   lineup categories rather than a real eligibility slot on either platform. Fine
   for standard RB/WR/TE flex; worth double-checking for unusual flex types.
-- Waiver search is capped to the top N free agents by naive point total
-  (`fa_prefilter`, default 40) before running the expensive delta calculation, to
-  keep runtime reasonable. Raise it if you want a wider search.
-- Trade search defaults to 1-for-1 swaps only (`combo_sizes=(1,)` in `trades.py`).
-  2-for-1 / 2-for-2 is supported by the code but will be much slower - use a small
-  `candidate_prefilter` if you turn it on.

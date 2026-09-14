@@ -2,13 +2,23 @@
 Configuration for all leagues the system should track - across
 platforms. Each entry needs a "platform" key: "espn" or "sleeper".
 
-ESPN entries need SWID/espn_s2 cookies (pull fresh from browser dev
-tools: Network tab -> any fantasy.espn.com request -> Cookies).
+ESPN entries need SWID/espn_s2 session cookies (pull fresh from
+browser dev tools: Network tab -> any fantasy.espn.com request ->
+Cookies). These are live authentication credentials for your ESPN
+account - NOT public. They are read from environment variables (see
+.env.example) instead of being hardcoded here, and this file is safe
+to commit / share.
 
 Sleeper entries need only a league_id - Sleeper's read API is public,
 no auth required. Find your league_id in the URL when viewing your
 league on sleeper.com, e.g. sleeper.com/leagues/<LEAGUE_ID>.
 """
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # reads a local .env file if present; real env vars always win
 
 SEASON = 2026
 
@@ -17,8 +27,8 @@ LEAGUES = [
         "platform": "espn",
         "name": "my_league",           # short slug, used as a label everywhere
         "league_id": 2077647142,
-        "swid": "{43F9DA5A-2D52-43C1-B9C7-DE593AD0A84D}",
-        "espn_s2": "AECeQlAUWUXSLPLFvcTWSK3dNeVePYmFPRiSVZNHo6eQCN7TGmoGGUPSL3rl7ncIyV2gtvv4zs23vU%2BgGaQ2yLeZGbNVfW8KWwNHBxIWRaP%2BRJrI8N0qZCrZL4Cq7FLSLrRMASripTOOyUFM%2B6%2BooTb8vOCstns77WComij0Q4ak%2Bp9wO%2F8SYzZatg13kw3xDhSt%2BHvIzuo9ChW2yK%2BO6G7tumnnpCaDTEjLTSSA9JNTKnoHgrtgajh5d7Ok%2BY0d0s8Pn0g1OqZckx%2F0x%2BMYiROhpcYoW84hCxZoGVTuq78oCQ%3D%3D",
+        "swid": os.environ.get("ESPN_SWID_MY_LEAGUE", ""),
+        "espn_s2": os.environ.get("ESPN_S2_MY_LEAGUE", ""),
         "my_team_id": 11,
     },
     {
@@ -33,6 +43,23 @@ START_WEEK = 1
 END_WEEK = 18
 
 DB_PATH = "fantasy.db"
+
+
+def require_espn_credentials():
+    """Raise a clear error for any ESPN league missing its SWID/espn_s2
+    cookies. Deliberately NOT run at import time - config.py also holds
+    constants (SLOT_MAP, FLEX_SLOT_ELIGIBILITY, ...) that plenty of code
+    needs without ever touching ESPN's API (lineup_optimizer.py, the
+    test suite), and those shouldn't require secrets to even import.
+    Called from ingest.py right before an ESPN league is actually hit.
+    """
+    for league in LEAGUES:
+        if league["platform"] == "espn" and not (league.get("swid") and league.get("espn_s2")):
+            raise RuntimeError(
+                f"League '{league['name']}' is an ESPN league but its SWID/espn_s2 "
+                "cookies are missing. Copy .env.example to .env and fill them in - "
+                "see the README for how to pull them from your browser."
+            )
 
 # ESPN's default lineup slot ID -> readable name (standard mapping used
 # across ESPN fantasy API tooling).
@@ -51,7 +78,7 @@ SLOT_MAP = {
 POSITION_MAP = {
     1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "D/ST",
     # IDP positions
-    9: "DT", 10: "DE", 11: "LB", 12: "CB", 13: "S",
+    8: "DT", 9: "DE", 10: "LB", 11: "DL", 12: "CB", 13: "S",
     14: "DB", 15: "DP", 7: "P",
 }
 
@@ -71,17 +98,3 @@ FLEX_SLOT_ELIGIBILITY = {
 
 # Slot names that never count toward a team's scoring lineup.
 NON_STARTING_SLOTS = {"BE", "BN", "IR", ""}
-
-# Preferred display ordering for lineup slots (QB, RB, WR, TE, FLEX, K, DEF, IDPs, ...)
-PREFERRED_SLOT_ORDER = [
-    "QB", "TQB", "RB", "RB/WR", "WR", "WR/TE", "TE",
-    "FLEX", "OP", "SUPER_FLEX", "K", "D/ST", "DEF", "P", "HC",
-    "DT", "DE", "DL", "LB", "CB", "S", "DB", "DP", "EDR", "Rookie",
-]
-
-
-def slot_sort_key(slot_name: str) -> int:
-    try:
-        return PREFERRED_SLOT_ORDER.index(slot_name)
-    except ValueError:
-        return 999

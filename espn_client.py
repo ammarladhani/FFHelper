@@ -9,9 +9,14 @@ weekly), run `python cli.py debug-raw` to dump a raw response and
 we'll adjust the field paths.
 """
 
+import logging
+
 import requests
 
+logger = logging.getLogger(__name__)
+
 PAGE_SIZE = 50
+REQUEST_TIMEOUT = 30
 
 
 def _base_url(league_cfg, season):
@@ -48,6 +53,13 @@ def fetch_players_week(league_cfg, season: int, week: int) -> list:
     Fetch every player for a given week: name, position, pro team,
     ownership (onTeamId; 0/absent = free agent), and projected points.
     Paginates until ESPN returns a short page.
+
+    Raises requests.HTTPError on a non-2xx response and RuntimeError if
+    ESPN returns a 200 with an embedded error payload (it does this for
+    e.g. expired/invalid cookies) - previously both cases just logged a
+    warning and silently returned a partial/empty player list, which
+    made a bad session cookie look identical to "nobody's a free agent
+    this week" during ingestion.
     """
     stat_id = f"11{season}{week}"
     base_url = _base_url(league_cfg, season)
@@ -65,21 +77,26 @@ def fetch_players_week(league_cfg, season: int, week: int) -> list:
         }
         params = {"view": "kona_player_info", "scoringPeriodId": week}
 
-        resp = requests.get(base_url, params=params, headers=headers, cookies=cookies)
-        if resp.status_code != 200:
-            print(f"  [warn] week {week} offset {offset}: status {resp.status_code}")
-            break
+        resp = requests.get(
+            base_url, params=params, headers=headers, cookies=cookies,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
 
         data = resp.json()
         if "messages" in data:
-            print(f"  [warn] week {week}: ESPN error {data['messages']}")
-            break
+            raise RuntimeError(
+                f"ESPN returned an error for week {week} (often means the SWID/"
+                f"espn_s2 cookies have expired - re-pull them from the browser): "
+                f"{data['messages']}"
+            )
 
         page = data.get("players", [])
         if not page:
             break
 
         all_players.extend(page)
+        logger.debug("week %d offset %d: fetched %d players", week, offset, len(page))
         if len(page) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
@@ -93,6 +110,6 @@ def fetch_league_settings(league_cfg, season: int) -> dict:
     cookies = _cookies(league_cfg)
     params = {"view": ["mSettings", "mTeam"]}
 
-    resp = requests.get(base_url, params=params, cookies=cookies)
+    resp = requests.get(base_url, params=params, cookies=cookies, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
