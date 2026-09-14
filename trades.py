@@ -24,17 +24,26 @@ def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
     as_of_week = as_of_week or start_week
     slot_counts = repo.get_slot_counts(conn, league_key)
 
+    # Shared across all four simulate_roster calls below - they all cover
+    # the same week range, so the same weeks' projections get fetched once.
+    player_info_cache = {}
+    projection_cache = {}
+
     a_ids = repo.get_roster_player_ids(conn, league_key, team_a_id, as_of_week)
     b_ids = repo.get_roster_player_ids(conn, league_key, team_b_id, as_of_week)
 
-    baseline_a = simulate_roster(conn, league_key, a_ids, slot_counts, start_week, end_week)
-    baseline_b = simulate_roster(conn, league_key, b_ids, slot_counts, start_week, end_week)
+    baseline_a = simulate_roster(conn, league_key, a_ids, slot_counts, start_week, end_week,
+                                  player_info_cache, projection_cache)
+    baseline_b = simulate_roster(conn, league_key, b_ids, slot_counts, start_week, end_week,
+                                  player_info_cache, projection_cache)
 
     new_a_ids = [pid for pid in a_ids if pid not in team_a_gives] + team_b_gives
     new_b_ids = [pid for pid in b_ids if pid not in team_b_gives] + team_a_gives
 
-    new_a = simulate_roster(conn, league_key, new_a_ids, slot_counts, start_week, end_week)
-    new_b = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week)
+    new_a = simulate_roster(conn, league_key, new_a_ids, slot_counts, start_week, end_week,
+                             player_info_cache, projection_cache)
+    new_b = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week,
+                             player_info_cache, projection_cache)
 
     return {
         "team_a": {"team_id": team_a_id, "before": baseline_a["total"], "after": new_a["total"],
@@ -46,7 +55,7 @@ def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
 
 def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_week: int,
                     as_of_week: int = None, candidate_prefilter: int = 12,
-                    combo_sizes=(1,2,), partner_team_id: int = None) -> list:
+                    combo_sizes=(1,), partner_team_id: int = None) -> list:
     """
     Search win-win 1-for-1 (and optionally larger, via combo_sizes)
     trades between my_team_id and every other team in the league - or,
@@ -60,15 +69,32 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
     combinations, since full combinatorics over a ~15-man roster on
     both sides explodes quickly.
 
-    Performance note: each team's "no trade happened" baseline total is
-    computed ONCE (not once per candidate combo, which is what a naive
-    call to evaluate_trade() in a loop would do) - and if a combo
-    doesn't even help your own team, the partner's side is never
-    simulated at all. Both cuts were the dominant cost here, since a
-    full season simulation runs the lineup optimizer for every week.
+    combo_sizes defaults to (1,) - i.e. 1-for-1 trades only. Trying
+    combo_sizes=(1, 2) also searches 2-for-2 swaps, which is supported
+    but MUCH slower (combinatorics grow fast), so it's opt-in rather
+    than the default.
+
+    Performance notes:
+    - Each team's "no trade happened" baseline total is computed ONCE
+      per opposing team (not once per candidate combo, which is what a
+      naive call to evaluate_trade() in a loop would do) - and if a
+      combo doesn't even help your own team, the partner's side is
+      never simulated at all.
+    - A player_info_cache / projection_cache pair is created once for
+      the entire search and shared across every simulate_roster() call
+      made here (baselines and every candidate trial, for every
+      partner team). Every trial only swaps 1-2 players in/out of a
+      ~15-man roster, and all trials cover the same week range, so the
+      same players' info and the same weeks' full projection maps get
+      reused thousands of times instead of re-queried from SQLite for
+      every single candidate. This is the single biggest lever on
+      trade-search runtime, on top of not defaulting to 2-for-2.
     """
     as_of_week = as_of_week or start_week
     slot_counts = repo.get_slot_counts(conn, league_key)
+
+    player_info_cache = {}
+    projection_cache = {}
 
     teams = repo.get_teams(conn, league_key)
     if partner_team_id is not None:
@@ -76,7 +102,8 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
 
     my_ids_full = repo.get_roster_player_ids(conn, league_key, my_team_id, as_of_week)
     my_candidates = _top_players_by_rest_of_season(conn, league_key, my_ids_full, start_week, end_week, candidate_prefilter)
-    my_baseline = simulate_roster(conn, league_key, my_ids_full, slot_counts, start_week, end_week)["total"]
+    my_baseline = simulate_roster(conn, league_key, my_ids_full, slot_counts, start_week, end_week,
+                                   player_info_cache, projection_cache)["total"]
 
     proposals = []
 
@@ -87,7 +114,8 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
 
         other_ids_full = repo.get_roster_player_ids(conn, league_key, other_id, as_of_week)
         other_candidates = _top_players_by_rest_of_season(conn, league_key, other_ids_full, start_week, end_week, candidate_prefilter)
-        other_baseline = simulate_roster(conn, league_key, other_ids_full, slot_counts, start_week, end_week)["total"]
+        other_baseline = simulate_roster(conn, league_key, other_ids_full, slot_counts, start_week, end_week,
+                                          player_info_cache, projection_cache)["total"]
 
         for size in combo_sizes:
             for my_combo in combinations(my_candidates, size):
@@ -95,13 +123,15 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
 
                 for other_combo in combinations(other_candidates, size):
                     trial_a_ids = new_a_ids + list(other_combo)
-                    new_a_total = simulate_roster(conn, league_key, trial_a_ids, slot_counts, start_week, end_week)["total"]
+                    new_a_total = simulate_roster(conn, league_key, trial_a_ids, slot_counts, start_week, end_week,
+                                                   player_info_cache, projection_cache)["total"]
                     my_delta = round(new_a_total - my_baseline, 2)
                     if my_delta <= 0:
                         continue  # doesn't even help me - skip the pricier partner-side check
 
                     new_b_ids = [pid for pid in other_ids_full if pid not in other_combo] + list(my_combo)
-                    new_b_total = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week)["total"]
+                    new_b_total = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week,
+                                                   player_info_cache, projection_cache)["total"]
                     partner_delta = round(new_b_total - other_baseline, 2)
                     if partner_delta <= 0:
                         continue
@@ -152,17 +182,24 @@ def explain_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
     as_of_week = as_of_week or start_week
     slot_counts = repo.get_slot_counts(conn, league_key)
 
+    player_info_cache = {}
+    projection_cache = {}
+
     a_ids = repo.get_roster_player_ids(conn, league_key, team_a_id, as_of_week)
     b_ids = repo.get_roster_player_ids(conn, league_key, team_b_id, as_of_week)
 
-    before_a = simulate_roster(conn, league_key, a_ids, slot_counts, start_week, end_week)
-    before_b = simulate_roster(conn, league_key, b_ids, slot_counts, start_week, end_week)
+    before_a = simulate_roster(conn, league_key, a_ids, slot_counts, start_week, end_week,
+                                player_info_cache, projection_cache)
+    before_b = simulate_roster(conn, league_key, b_ids, slot_counts, start_week, end_week,
+                                player_info_cache, projection_cache)
 
     new_a_ids = [pid for pid in a_ids if pid not in team_a_gives] + team_b_gives
     new_b_ids = [pid for pid in b_ids if pid not in team_b_gives] + team_a_gives
 
-    after_a = simulate_roster(conn, league_key, new_a_ids, slot_counts, start_week, end_week)
-    after_b = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week)
+    after_a = simulate_roster(conn, league_key, new_a_ids, slot_counts, start_week, end_week,
+                               player_info_cache, projection_cache)
+    after_b = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week,
+                               player_info_cache, projection_cache)
 
     return {
         "team_a": {

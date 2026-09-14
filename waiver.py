@@ -1,4 +1,3 @@
-
 """
 For a given team, find which free agent add/drop combination maximizes
 the team's remaining-season optimized point total.
@@ -16,7 +15,7 @@ from simulator import simulate_roster
 
 
 def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week: int,
-                 as_of_week: int = None, top_n: int = 10, fa_prefilter: int = 2533) -> list:
+                 as_of_week: int = None, top_n: int = 10, fa_prefilter: int = 40) -> list:
     total_start = time.perf_counter()
 
     as_of_week = as_of_week or start_week
@@ -31,7 +30,10 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
         conn, league_key, team_id, as_of_week
     )
 
-    # Shared caches for every simulate_roster() call in this run.
+    # Shared caches for every simulate_roster() call in this run - each
+    # candidate add/drop only differs by a couple of players, so the same
+    # player info and the same weeks' projections get reused across
+    # hundreds of candidate simulations instead of re-queried each time.
     player_info_cache = {}
     projection_cache = {}
 
@@ -189,6 +191,9 @@ def explain_pickup(conn, league_key: str, team_id: int, add_player_id: int, drop
         conn, league_key, team_id, as_of_week
     )
 
+    player_info_cache = {}
+    projection_cache = {}
+
     before = simulate_roster(
         conn,
         league_key,
@@ -196,6 +201,8 @@ def explain_pickup(conn, league_key: str, team_id: int, add_player_id: int, drop
         slot_counts,
         start_week,
         end_week,
+        player_info_cache,
+        projection_cache,
     )
 
     new_ids = [pid for pid in current_ids if pid != drop_player_id] + [add_player_id]
@@ -207,6 +214,8 @@ def explain_pickup(conn, league_key: str, team_id: int, add_player_id: int, drop
         slot_counts,
         start_week,
         end_week,
+        player_info_cache,
+        projection_cache,
     )
 
     return {

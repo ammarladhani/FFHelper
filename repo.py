@@ -111,48 +111,73 @@ def get_roster_with_projection(
     league_key: str,
     player_ids: list,
     week: int,
+    player_info_cache: dict = None,
+    projection_cache: dict = None,
 ) -> list:
     """Build player dicts for the lineup optimizer - one batched query for
     player info, one for that week's projections, instead of two queries
     PER PLAYER. This function gets called once per week inside every
     simulate_roster call, which itself gets called many times over by
     waiver/trade search - the per-player query pattern was the single
-    biggest cost multiplier in the whole system."""
+    biggest cost multiplier in the whole system.
+
+    player_info_cache / projection_cache are OPTIONAL dicts the caller can
+    create once and pass into many calls (e.g. across every candidate
+    roster tried by waiver.py / trades.py) so the same player's info, and
+    the same week's full projection map, only get fetched from SQLite
+    once per search run - not once per candidate roster tried. If omitted,
+    each call just uses its own throwaway cache (same behavior as before).
+
+    - player_info_cache is keyed by player_id (player info never changes
+      within a run).
+    - projection_cache is keyed by (league_key, week) -> {player_id: pts}
+      for the WHOLE week (not just player_ids), since different candidate
+      rosters overlap heavily in which weeks/players they touch, and
+      fetching the whole week once is cheap and reusable.
+    """
     if not player_ids:
         return []
 
-    placeholders = ",".join("?" for _ in player_ids)
+    if player_info_cache is None:
+        player_info_cache = {}
+    if projection_cache is None:
+        projection_cache = {}
 
-    player_rows = conn.execute(
-        f"""
-        SELECT player_id, name, position, eligible_slots
-        FROM players
-        WHERE player_id IN ({placeholders})
-        """,
-        player_ids,
-    ).fetchall()
+    missing_ids = [pid for pid in player_ids if pid not in player_info_cache]
+    if missing_ids:
+        placeholders = ",".join("?" for _ in missing_ids)
+        rows = conn.execute(
+            f"""
+            SELECT player_id, name, position, eligible_slots
+            FROM players
+            WHERE player_id IN ({placeholders})
+            """,
+            missing_ids,
+        ).fetchall()
+        for pid, name, position, eligible_slots_json in rows:
+            try:
+                eligible_slots = json.loads(eligible_slots_json) if eligible_slots_json else []
+            except (TypeError, json.JSONDecodeError):
+                eligible_slots = []
+            player_info_cache[pid] = {
+                "name": name,
+                "position": position,
+                "eligible_slots": eligible_slots,
+            }
 
-    info_map = {}
-    for pid, name, position, eligible_slots_json in player_rows:
-        try:
-            eligible_slots = json.loads(eligible_slots_json) if eligible_slots_json else []
-        except (TypeError, json.JSONDecodeError):
-            eligible_slots = []
-        info_map[pid] = {"name": name, "position": position, "eligible_slots": eligible_slots}
-
-    proj_rows = conn.execute(
-        f"""
-        SELECT player_id, projected_points
-        FROM projections
-        WHERE league_key = ? AND week = ? AND player_id IN ({placeholders})
-        """,
-        [league_key, week] + player_ids,
-    ).fetchall()
-    proj_map = {pid: pts for pid, pts in proj_rows}
+    week_key = (league_key, week)
+    week_projections = projection_cache.get(week_key)
+    if week_projections is None:
+        rows = conn.execute(
+            "SELECT player_id, projected_points FROM projections WHERE league_key = ? AND week = ?",
+            (league_key, week),
+        ).fetchall()
+        week_projections = {pid: pts for pid, pts in rows}
+        projection_cache[week_key] = week_projections
 
     players = []
     for pid in player_ids:
-        info = info_map.get(pid)
+        info = player_info_cache.get(pid)
         if not info:
             continue
         players.append({
@@ -160,7 +185,7 @@ def get_roster_with_projection(
             "name": info["name"],
             "position": info["position"],
             "eligible_slots": info["eligible_slots"],
-            "projected": proj_map.get(pid),
+            "projected": week_projections.get(pid),
         })
 
     return players

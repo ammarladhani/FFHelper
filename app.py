@@ -54,6 +54,33 @@ my_team_id = team_labels[my_team_label]
 
 start_week, end_week = st.sidebar.slider("Week range", 1, 18, (1, 18))
 st.sidebar.caption(f"League key: `{league}` · Team ID: `{my_team_id}`")
+st.sidebar.caption(
+    "Switching league, team, or week range doesn't automatically re-run a search - "
+    "hit the button again in whichever tab you're using."
+)
+
+
+def _labeled_player_map(conn, player_ids):
+    """name -> player_id, but with the player_id appended when two players
+    on the same roster happen to share a display name (e.g. two IDP guys
+    with common names) so the dropdown never silently collides them."""
+    infos = [repo.get_player_info(conn, pid) for pid in player_ids]
+    name_counts = {}
+    for info in infos:
+        if info:
+            name_counts[info["name"]] = name_counts.get(info["name"], 0) + 1
+
+    labeled = {}
+    for info in infos:
+        if not info:
+            continue
+        if name_counts[info["name"]] > 1:
+            label = f"{info['name']} ({info['player_id']})"
+        else:
+            label = info["name"]
+        labeled[label] = info["player_id"]
+    return labeled
+
 
 tab_standings, tab_waiver, tab_trade_finder, tab_trade_eval, tab_rosters = st.tabs(
     ["📊 Standings", "🔄 Waiver Wire", "🤝 Trade Finder", "⚖️ Evaluate Trade", "📋 Rosters"]
@@ -63,6 +90,7 @@ tab_standings, tab_waiver, tab_trade_finder, tab_trade_eval, tab_rosters = st.ta
 
 with tab_standings:
     st.subheader(f"Projected totals, weeks {start_week}-{end_week}")
+    st.caption("Every team's optimal starting lineup, week by week, summed to a season total.")
     if st.button("Run simulation", key="sim_btn"):
         with st.spinner("Simulating every team's optimal lineup, week by week..."):
             results = simulator.simulate_all_teams(conn, league, start_week, end_week)
@@ -78,9 +106,13 @@ with tab_standings:
 
 with tab_waiver:
     st.subheader(f"Best pickups for {my_team_label}")
+    st.caption("Tries every free agent against every roster spot on your team and ranks the best add/drop combos.")
     col1, col2 = st.columns(2)
     top_n = col1.slider("How many to show", 5, 50, 15, key="waiver_topn")
-    fa_prefilter = col2.slider("Free agents considered", 10, 100, 40, key="waiver_prefilter")
+    fa_prefilter = col2.slider(
+        "Free agents considered", 10, 100, 40, key="waiver_prefilter",
+        help="Only the top N free agents by raw projected points are tested in depth. Higher = more thorough but slower.",
+    )
 
     if st.button("Find pickups", key="waiver_btn"):
         with st.spinner("Testing every free agent against every roster spot..."):
@@ -121,22 +153,39 @@ with tab_waiver:
 
 with tab_trade_finder:
     st.subheader(f"Win-win trades for {my_team_label}")
+    st.caption("Searches for trades where BOTH sides' projected season totals go up.")
 
     partner_labels = {"Any team": None}
     partner_labels.update({t["team_name"]: t["team_id"] for t in teams if t["team_id"] != my_team_id})
     partner_choice = st.selectbox("Trade partner", list(partner_labels.keys()), key="partner_select")
     partner_team_id = partner_labels[partner_choice]
 
-    c1, c2, c3 = st.columns(3)
-    prefilter = c1.slider("Search depth (prefilter)", 4, 16, 12, key="trade_prefilter")
+    c1, c2 = st.columns(2)
+    prefilter = c1.slider(
+        "Search depth (prefilter)", 4, 16, 12, key="trade_prefilter",
+        help="Only the top N players per roster (by raw projected points) are considered as trade pieces.",
+    )
     top_n = c2.slider("Show top N", 5, 50, 10, key="trade_topn")
-    c3.caption("Higher search depth = slower but more thorough")
+
+    deep_search = st.checkbox(
+        "Also search 2-for-2 trades (much slower)",
+        value=False,
+        key="trade_deep_search",
+        help="Off = 1-for-1 trades only (fast). On = also tries 2-for-2 swaps, "
+             "which grows combinatorially and can take a lot longer, especially "
+             "with a high search depth or 'Any team' as the partner.",
+    )
+    combo_sizes = (1, 2) if deep_search else (1,)
 
     if st.button("Find trades", key="trade_btn"):
-        with st.spinner("Searching for win-win trades... this can take a bit"):
+        spinner_msg = "Searching for win-win trades..."
+        if deep_search:
+            spinner_msg += " (2-for-2 included, this can take a while)"
+        with st.spinner(spinner_msg):
             all_proposals = trades.suggest_trades(
                 conn, league, my_team_id, start_week, end_week,
                 candidate_prefilter=prefilter, partner_team_id=partner_team_id,
+                combo_sizes=combo_sizes,
             )
         st.session_state["trade_proposals"] = all_proposals
 
@@ -184,8 +233,8 @@ with tab_trade_eval:
 
         my_ids = repo.get_roster_player_ids(conn, league, my_team_id, start_week)
         other_ids = repo.get_roster_player_ids(conn, league, other_team_id, start_week)
-        my_names = {repo.get_player_info(conn, pid)["name"]: pid for pid in my_ids}
-        other_names = {repo.get_player_info(conn, pid)["name"]: pid for pid in other_ids}
+        my_names = _labeled_player_map(conn, my_ids)
+        other_names = _labeled_player_map(conn, other_ids)
 
         c1, c2 = st.columns(2)
         give_selection = c1.multiselect(f"You give ({my_team_label})", list(my_names.keys()))
