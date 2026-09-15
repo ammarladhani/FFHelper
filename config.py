@@ -70,6 +70,13 @@ SLOT_MAP = {
     20: "BE", 21: "IR", 22: "", 23: "FLEX", 24: "EDR", 25: "Rookie",
 }
 
+# Slot names that lock a player onto a roster - the manager can leave
+# them there, but the automated waiver/trade tooling shouldn't treat
+# them as free to drop/trade the way a normal bench player is.
+# Distinct from NON_STARTING_SLOTS: BE is also non-scoring but IS
+# freely droppable.
+RESERVED_SLOT_NAMES = {"IR", "TAXI"}
+
 # Player's default position ID -> readable name (ESPN only - Sleeper
 # reports position as a plain string natively, no ID lookup needed).
 # ESPN uses two separate numbering schemes that happen not to collide:

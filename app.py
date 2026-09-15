@@ -22,7 +22,9 @@ st.set_page_config(page_title="Fantasy Optimizer", page_icon="🏈", layout="wid
 
 @st.cache_resource
 def get_connection():
-    return db.get_conn(config.DB_PATH)
+    conn = db.get_conn(config.DB_PATH)
+    db.init_schema(conn)   # <-- add this: safe/idempotent, adds `reserved` column if missing
+    return conn
 
 
 conn = get_connection()
@@ -248,9 +250,18 @@ with tab_trade_eval:
         other_team_id = other_labels[other_team_label]
 
         my_ids = repo.get_roster_player_ids(conn, league, my_team_id, start_week)
+        my_reserved = repo.get_reserved_player_ids(conn, league, my_team_id, start_week)
+        my_names = {
+            repo.get_player_info(conn, pid)["name"]: pid
+            for pid in my_ids if pid not in my_reserved
+        }
+
         other_ids = repo.get_roster_player_ids(conn, league, other_team_id, start_week)
-        my_names = {repo.get_player_info(conn, pid)["name"]: pid for pid in my_ids}
-        other_names = {repo.get_player_info(conn, pid)["name"]: pid for pid in other_ids}
+        other_reserved = repo.get_reserved_player_ids(conn, league, other_team_id, start_week)
+        other_names = {
+            repo.get_player_info(conn, pid)["name"]: pid
+            for pid in other_ids if pid not in other_reserved
+        }
 
         c1, c2 = st.columns(2)
         give_selection = c1.multiselect(f"You give ({my_team_label})", list(my_names.keys()))

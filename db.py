@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS ownership (
     player_id    TEXT NOT NULL,
     week         INTEGER NOT NULL,
     team_id      INTEGER,
+    reserved     TEXT,  -- 'IR' / 'TAXI' / NULL (normal active roster spot)
     PRIMARY KEY (league_key, player_id, week)
 );
 """
@@ -75,7 +76,13 @@ def init_schema(conn: sqlite3.Connection):
 
     if "eligible_slots" not in columns:
         conn.execute("ALTER TABLE players ADD COLUMN eligible_slots TEXT")
-
+    
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(ownership)").fetchall()
+    }
+    if "reserved" not in columns:
+        conn.execute("ALTER TABLE ownership ADD COLUMN reserved TEXT")
     conn.commit()
 
 
@@ -157,12 +164,12 @@ def upsert_projection(conn, league_key, player_id, week, projected_points):
     )
 
 
-def upsert_ownership(conn, league_key, player_id, week, team_id):
+def upsert_ownership(conn, league_key, player_id, week, team_id, reserved=None):
     conn.execute(
         "INSERT INTO ownership "
-        "(league_key, player_id, week, team_id) "
-        "VALUES (?, ?, ?, ?) "
+        "(league_key, player_id, week, team_id, reserved) "
+        "VALUES (?, ?, ?, ?, ?) "
         "ON CONFLICT(league_key, player_id, week) DO UPDATE SET "
-        "team_id=excluded.team_id",
-        (league_key, player_id, week, team_id),
+        "team_id=excluded.team_id, reserved=excluded.reserved",
+        (league_key, player_id, week, team_id, reserved),
     )

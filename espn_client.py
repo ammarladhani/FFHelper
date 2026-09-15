@@ -113,3 +113,27 @@ def fetch_league_settings(league_cfg, season: int) -> dict:
     resp = requests.get(base_url, params=params, cookies=cookies, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
+
+def fetch_roster_slots(league_cfg, season: int, week: int) -> dict:
+    """
+    Raw ESPN player id -> lineupSlotId, for every rostered player, as of
+    this scoring period. Used to detect IR: occupying lineup slot 21
+    ("IR" in config.SLOT_MAP) is how ESPN marks a player roster-locked,
+    as opposed to sitting on the bench (slot 20, "BE"), which stays
+    freely droppable.
+    """
+    base_url = _base_url(league_cfg, season)
+    cookies = _cookies(league_cfg)
+    params = {"view": "mRoster", "scoringPeriodId": week}
+
+    resp = requests.get(base_url, params=params, cookies=cookies, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+
+    slots = {}
+    for team in data.get("teams", []):
+        for entry in (team.get("roster") or {}).get("entries", []):
+            player_id = entry.get("playerId")
+            if player_id is not None:
+                slots[player_id] = entry.get("lineupSlotId")
+    return slots

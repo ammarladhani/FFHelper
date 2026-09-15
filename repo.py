@@ -160,6 +160,16 @@ def get_projection(conn, league_key: str, player_id: str, week: int):
 
     return row[0] if row else None
 
+def get_reserved_player_ids(conn, league_key: str, team_id: int, as_of_week: int) -> set:
+    """player_ids on this team, at this week, sitting in an IR/Taxi
+    (config.RESERVED_SLOT_NAMES) slot - i.e. roster-locked, not
+    eligible to be dropped via waiver or included in a trade."""
+    rows = conn.execute(
+        "SELECT player_id FROM ownership "
+        "WHERE league_key = ? AND team_id = ? AND week = ? AND reserved IS NOT NULL",
+        (league_key, team_id, as_of_week),
+    ).fetchall()
+    return {r[0] for r in rows}
 
 def get_roster_with_projection(
     conn,

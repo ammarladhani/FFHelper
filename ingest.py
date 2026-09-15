@@ -50,37 +50,126 @@ def ingest_espn_league_settings(conn, league_cfg, league_key, season):
 
 
 def ingest_espn_week(conn, league_cfg, league_key, season, week):
-    players, stat_id = espn_client.fetch_players_week(league_cfg, season, week)
+    players, stat_id = espn_client.fetch_players_week(
+        league_cfg, season, week
+    )
+    roster_slots = espn_client.fetch_roster_slots(
+        league_cfg, season, week
+    )
+
     print(f"[{league_key}] (espn) week {week}: {len(players)} players")
 
     for p in players:
         raw_id = p.get("id")
+        if raw_id is None:
+            continue
+
         player_id = f"espn_{raw_id}"
 
-        onteam_id = p.get("onTeamId", 0)  # 0 = free agent in ESPN's convention
-        team_id = onteam_id if onteam_id and onteam_id > 0 else None
+        # ---------------------------------------------------------
+        # Player information
+        # ---------------------------------------------------------
+        player = p.get("player") or {}
 
-        player_obj = p.get("player", {})
-        name = player_obj.get("fullName", "Unknown")
-        pos_id = player_obj.get("defaultPositionId")
-        position = config.POSITION_MAP.get(pos_id, f"pos_{pos_id}")
-        pro_team_id = player_obj.get("proTeamId")
-
-        proj_stats = player_obj.get("stats", [])
-        projected = next(
-            (s.get("appliedTotal") for s in proj_stats if s.get("id") == stat_id),
-            None,
+        name = (
+            player.get("fullName")
+            or f"{player.get('firstName', '')} {player.get('lastName', '')}".strip()
+            or str(raw_id)
         )
 
-        # Convert ESPN's numeric eligibleSlots to slot NAME strings, so
-        # eligibility is stored in the same platform-agnostic shape
-        # Sleeper uses natively (see lineup_optimizer.py).
-        raw_eligible = player_obj.get("eligibleSlots", [])
-        eligible_slots = [config.SLOT_MAP.get(sid, f"slot_{sid}") for sid in raw_eligible]
+        position_id = player.get("defaultPositionId")
+        position = config.POSITION_MAP.get(
+            position_id,
+            f"pos_{position_id}" if position_id is not None else None,
+        )
 
-        db.upsert_player(conn, player_id, name, position, pro_team_id, eligible_slots)
-        db.upsert_projection(conn, league_key, player_id, week, projected)
-        db.upsert_ownership(conn, league_key, player_id, week, team_id)
+        pro_team_id = player.get("proTeamId")
+
+        # ESPN gives eligibleSlots as numeric slot IDs.
+        # Convert them to the common slot-name representation used
+        # everywhere downstream by lineup_optimizer.py.
+        raw_eligible_slots = player.get("eligibleSlots") or []
+
+        eligible_slots = [
+            config.SLOT_MAP[slot_id]
+            for slot_id in raw_eligible_slots
+            if slot_id in config.SLOT_MAP
+        ]
+
+        # ---------------------------------------------------------
+        # Ownership
+        # ---------------------------------------------------------
+        onteam_id = p.get("onTeamId", 0)
+
+        team_id = (
+            onteam_id
+            if onteam_id is not None and onteam_id > 0
+            else None
+        )
+
+        # ---------------------------------------------------------
+        # Weekly projection
+        # ---------------------------------------------------------
+        projected = None
+
+        stats = player.get("stats") or []
+
+        for stat in stats:
+            if not isinstance(stat, dict):
+                continue
+
+            if (
+                stat.get("scoringPeriodId") == week
+                and stat.get("statSourceId") == 1
+            ):
+                projected = stat.get("appliedTotal")
+                break
+
+        # ---------------------------------------------------------
+        # Reserved roster slot
+        # ---------------------------------------------------------
+        lineup_slot_id = roster_slots.get(raw_id)
+
+        slot_name = (
+            config.SLOT_MAP.get(lineup_slot_id)
+            if lineup_slot_id is not None
+            else None
+        )
+
+        reserved = (
+            slot_name
+            if slot_name in config.RESERVED_SLOT_NAMES
+            else None
+        )
+
+        # ---------------------------------------------------------
+        # Database
+        # ---------------------------------------------------------
+        db.upsert_player(
+            conn,
+            player_id,
+            name,
+            position,
+            pro_team_id,
+            eligible_slots,
+        )
+
+        db.upsert_projection(
+            conn,
+            league_key,
+            player_id,
+            week,
+            projected,
+        )
+
+        db.upsert_ownership(
+            conn,
+            league_key,
+            player_id,
+            week,
+            team_id,
+            reserved,
+        )
 
     conn.commit()
 
@@ -125,9 +214,14 @@ def ingest_sleeper_week(conn, league_cfg, league_key, season, week):
 
     rosters = sleeper_client.fetch_rosters(league_id)
     ownership_map = {}  # raw sleeper player_id (str) -> roster_id
+    reserved_map = {}  # raw sleeper player_id (str) -> "IR" / "TAXI"
     for r in rosters:
         for pid in (r.get("players") or []):
             ownership_map[pid] = r["roster_id"]
+        for pid in (r.get("reserve") or []):
+            reserved_map[pid] = "IR"
+        for pid in (r.get("taxi") or []):
+            reserved_map[pid] = "TAXI"
 
     projections = sleeper_client.fetch_projections_week(season, week)
     print(f"[{league_key}] (sleeper) week {week}: {len(projections)} projection entries")
@@ -158,7 +252,7 @@ def ingest_sleeper_week(conn, league_cfg, league_key, season, week):
 
         db.upsert_player(conn, player_id, name, position, None, eligible_slots)
         db.upsert_projection(conn, league_key, player_id, week, projected)
-        db.upsert_ownership(conn, league_key, player_id, week, team_id)
+        db.upsert_ownership(conn, league_key, player_id, week, team_id, reserved_map.get(raw_id))
 
     # Rostered players absent from this week's projections (bye week, or
     # just not covered by Sleeper's projection provider) still need an
@@ -166,7 +260,7 @@ def ingest_sleeper_week(conn, league_cfg, league_key, season, week):
     for raw_id, team_id in ownership_map.items():
         if raw_id not in seen_raw_ids:
             player_id = f"sleeper_{raw_id}"
-            db.upsert_ownership(conn, league_key, player_id, week, team_id)
+            db.upsert_ownership(conn, league_key, player_id, week, team_id, reserved_map.get(raw_id))
             db.upsert_projection(conn, league_key, player_id, week, None)
 
     conn.commit()

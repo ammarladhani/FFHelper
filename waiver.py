@@ -50,21 +50,16 @@ def _get_fa_pool(conn, league_key: str, as_of_week: int, start_week: int, end_we
     return repo.get_free_agents_ranked(conn, league_key, as_of_week, start_week, end_week, limit=fa_prefilter)
 
 
-def _search_pickups(conn, league_key: str, current_ids: list, fa_ids: list, slot_counts: dict,
-                     start_week: int, end_week: int, player_info_cache: dict, projection_cache: dict,
-                     top_n: int) -> tuple:
+def _search_pickups(conn, league_key: str, current_ids: list, droppable_ids: list, fa_ids: list,
+                     slot_counts: dict, start_week: int, end_week: int, player_info_cache: dict,
+                     projection_cache: dict, top_n: int) -> tuple:
     """
-    Core search: given an EXPLICIT roster (current_ids) and an EXPLICIT
-    free agent pool (fa_ids) - as opposed to a team_id/as_of_week this
-    looks up itself - try every free agent against every roster spot
-    and return the top_n add/drop combos, sorted by projected gain,
-    plus the baseline total they were compared against.
-
-    Pulled out of best_pickups() so plan_waiver_moves() can call it
-    once per step against a roster that's already been modified by
-    earlier steps in the same plan, and a free agent pool that's
-    already had earlier picks removed from it - best_pickups() itself
-    always searches the real, unmodified DB roster.
+    ...same docstring, plus:
+    `droppable_ids` is the subset of current_ids allowed to be dropped
+    (IR/Taxi players excluded) - current_ids itself still gets simulated
+    in full, since a reserved player still occupies a roster spot and
+    affects the baseline; only the "drop" half of each candidate move is
+    restricted to droppable_ids.
     """
     baseline = simulate_roster(
         conn, league_key, current_ids, slot_counts, start_week, end_week,
@@ -80,7 +75,7 @@ def _search_pickups(conn, league_key: str, current_ids: list, fa_ids: list, slot
         best_delta = None
         best_drop_info = None
 
-        for drop_id in current_ids:
+        for drop_id in droppable_ids:   # was: current_ids
             new_ids = [pid for pid in current_ids if pid != drop_id] + [fa_id]
             sim = simulate_roster(
                 conn, league_key, new_ids, slot_counts, start_week, end_week,
@@ -107,9 +102,10 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
                   fa_per_position: int = DEFAULT_FA_PER_POSITION) -> list:
     total_start = time.perf_counter()
     as_of_week = as_of_week or start_week
-
     slot_counts = repo.get_slot_counts(conn, league_key)
     current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
+    reserved_ids = repo.get_reserved_player_ids(conn, league_key, team_id, as_of_week)
+    droppable_ids = [pid for pid in current_ids if pid not in reserved_ids]
 
     player_info_cache: dict = {}
     projection_cache: dict = {}
@@ -118,7 +114,7 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
                           fa_prefilter, by_position, fa_per_position)
 
     results, _baseline = _search_pickups(
-        conn, league_key, current_ids, fa_ids, slot_counts, start_week, end_week,
+        conn, league_key, current_ids, droppable_ids, fa_ids, slot_counts, start_week, end_week,
         player_info_cache, projection_cache, top_n=top_n,
     )
 
@@ -153,6 +149,7 @@ def plan_waiver_moves(conn, league_key: str, team_id: int, start_week: int, end_
     as_of_week = as_of_week or start_week
     slot_counts = repo.get_slot_counts(conn, league_key)
     current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
+    reserved_ids = repo.get_reserved_player_ids(conn, league_key, team_id, as_of_week)
     fa_pool = _get_fa_pool(conn, league_key, as_of_week, start_week, end_week,
                             fa_prefilter, by_position, fa_per_position)
 
@@ -170,8 +167,9 @@ def plan_waiver_moves(conn, league_key: str, team_id: int, start_week: int, end_
         if not fa_pool:
             break
 
+        droppable_ids = [pid for pid in current_ids if pid not in reserved_ids]
         top_results, baseline = _search_pickups(
-            conn, league_key, current_ids, fa_pool, slot_counts, start_week, end_week,
+            conn, league_key, current_ids, droppable_ids, fa_pool, slot_counts, start_week, end_week,
             player_info_cache, projection_cache, top_n=1,
         )
         if not top_results or not top_results[0]["projected_gain"] or top_results[0]["projected_gain"] <= 0:
@@ -208,6 +206,11 @@ def explain_pickup(conn, league_key: str, team_id: int, add_player_id: str, drop
     a specific add/drop, for the "why does this help" view.
     """
     as_of_week = as_of_week or start_week
+    reserved_ids = repo.get_reserved_player_ids(conn, league_key, team_id, as_of_week)
+    if drop_player_id in reserved_ids:
+        info = repo.get_player_info(conn, drop_player_id)
+        name = info["name"] if info else drop_player_id
+        raise ValueError(f"Can't drop {name}: currently on IR/Taxi, not eligible to be dropped.")
     slot_counts = repo.get_slot_counts(conn, league_key)
     current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
 

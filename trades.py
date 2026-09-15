@@ -17,11 +17,19 @@ from itertools import combinations
 import repo
 from simulator import simulate_roster
 
+def _reject_reserved(conn, league_key, team_id, player_ids, as_of_week):
+    reserved = repo.get_reserved_player_ids(conn, league_key, team_id, as_of_week)
+    locked = [pid for pid in player_ids if pid in reserved]
+    if locked:
+        names = [repo.get_player_info(conn, pid)["name"] for pid in locked]
+        raise ValueError(f"Can't trade {', '.join(names)}: currently on IR/Taxi.")
 
 def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
                     team_b_id: int, team_b_gives: list, start_week: int, end_week: int,
                     as_of_week: int = None) -> dict:
     as_of_week = as_of_week or start_week
+    _reject_reserved(conn, league_key, team_a_id, team_a_gives, as_of_week)
+    _reject_reserved(conn, league_key, team_b_id, team_b_gives, as_of_week)
     slot_counts = repo.get_slot_counts(conn, league_key)
 
     a_ids = repo.get_roster_player_ids(conn, league_key, team_a_id, as_of_week)
@@ -91,7 +99,11 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
     projection_cache: dict = {}
 
     my_ids_full = repo.get_roster_player_ids(conn, league_key, my_team_id, as_of_week)
-    my_candidates = _top_players_by_rest_of_season(conn, league_key, my_ids_full, start_week, end_week, candidate_prefilter)
+    my_reserved = repo.get_reserved_player_ids(conn, league_key, my_team_id, as_of_week)
+    my_tradeable_ids = [pid for pid in my_ids_full if pid not in my_reserved]
+    my_candidates = _top_players_by_rest_of_season(
+        conn, league_key, my_tradeable_ids, start_week, end_week, candidate_prefilter,
+    )
     my_baseline = simulate_roster(
         conn, league_key, my_ids_full, slot_counts, start_week, end_week,
         player_info_cache, projection_cache,
@@ -105,7 +117,11 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
             continue
 
         other_ids_full = repo.get_roster_player_ids(conn, league_key, other_id, as_of_week)
-        other_candidates = _top_players_by_rest_of_season(conn, league_key, other_ids_full, start_week, end_week, candidate_prefilter)
+        other_reserved = repo.get_reserved_player_ids(conn, league_key, other_id, as_of_week)
+        other_tradeable_ids = [pid for pid in other_ids_full if pid not in other_reserved]
+        other_candidates = _top_players_by_rest_of_season(
+            conn, league_key, other_tradeable_ids, start_week, end_week, candidate_prefilter,
+        )
         other_baseline = simulate_roster(
             conn, league_key, other_ids_full, slot_counts, start_week, end_week,
             player_info_cache, projection_cache,
