@@ -2,10 +2,21 @@
 For a given team, find which free agent add/drop combination maximizes
 the team's remaining-season optimized point total.
 
-To keep the search tractable, free agents are pre-filtered down to the
-top `fa_prefilter` by naive rest-of-season projected sum (a cheap SQL
-query) before running the expensive lineup-optimizer-based delta
-calculation on each candidate.
+Two entry points:
+- best_pickups: one-shot search - top N single add/drop combos against
+  the CURRENT roster, unmodified.
+- plan_waiver_moves: chains moves - finds the single best add/drop,
+  applies it, then searches again against the now-modified roster
+  (and a free agent pool with that pickup removed), repeating until no
+  move gains anything. Answers "after I make that first move, what's
+  the NEXT best thing to do?" instead of just the first move alone.
+
+To keep the search tractable, free agents are pre-filtered before the
+expensive lineup-optimizer-based delta calculation on each candidate -
+either to the top `fa_prefilter` overall, or (with by_position=True)
+to the top `fa_per_position` at EACH position separately, so a deep
+position (WR) can't flood a shallow one (QB/TE/K) out of the search
+entirely.
 """
 
 import logging
@@ -24,36 +35,43 @@ logger = logging.getLogger(__name__)
 # simulations. Raise it explicitly per-call if you want a wider search.
 DEFAULT_FA_PREFILTER = 40
 
+# Default when by_position=True - top N free agents AT EACH position,
+# rather than DEFAULT_FA_PREFILTER total across all positions combined.
+DEFAULT_FA_PER_POSITION = 10
 
-def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week: int,
-                  as_of_week: int = None, top_n: int = 10,
-                  fa_prefilter: int = DEFAULT_FA_PREFILTER) -> list:
-    total_start = time.perf_counter()
-    as_of_week = as_of_week or start_week
 
-    slot_counts = repo.get_slot_counts(conn, league_key)
-    current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
+def _get_fa_pool(conn, league_key: str, as_of_week: int, start_week: int, end_week: int,
+                  fa_prefilter: int, by_position: bool, fa_per_position: int) -> list:
+    if by_position:
+        return repo.get_free_agents_ranked_by_position(
+            conn, league_key, as_of_week, start_week, end_week,
+            limit_per_position=fa_per_position,
+        )
+    return repo.get_free_agents_ranked(conn, league_key, as_of_week, start_week, end_week, limit=fa_prefilter)
 
-    # Shared across every simulate_roster() call in this run so a
-    # player's info/eligibility and a given week's projection are each
-    # only ever fetched from SQLite once, no matter how many candidate
-    # rosters we try.
-    player_info_cache: dict = {}
-    projection_cache: dict = {}
 
+def _search_pickups(conn, league_key: str, current_ids: list, fa_ids: list, slot_counts: dict,
+                     start_week: int, end_week: int, player_info_cache: dict, projection_cache: dict,
+                     top_n: int) -> tuple:
+    """
+    Core search: given an EXPLICIT roster (current_ids) and an EXPLICIT
+    free agent pool (fa_ids) - as opposed to a team_id/as_of_week this
+    looks up itself - try every free agent against every roster spot
+    and return the top_n add/drop combos, sorted by projected gain,
+    plus the baseline total they were compared against.
+
+    Pulled out of best_pickups() so plan_waiver_moves() can call it
+    once per step against a roster that's already been modified by
+    earlier steps in the same plan, and a free agent pool that's
+    already had earlier picks removed from it - best_pickups() itself
+    always searches the real, unmodified DB roster.
+    """
     baseline = simulate_roster(
         conn, league_key, current_ids, slot_counts, start_week, end_week,
         player_info_cache, projection_cache,
-    )
-    baseline_total = baseline["total"]
-
-    fa_ids = repo.get_free_agents_ranked(
-        conn, league_key, as_of_week, start_week, end_week, limit=fa_prefilter,
-    )
+    )["total"]
 
     results = []
-    simulation_count = 0
-
     for fa_id in fa_ids:
         fa_info = repo.get_player_info(conn, fa_id, cache=player_info_cache)
         if not fa_info:
@@ -64,14 +82,11 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
 
         for drop_id in current_ids:
             new_ids = [pid for pid in current_ids if pid != drop_id] + [fa_id]
-
             sim = simulate_roster(
                 conn, league_key, new_ids, slot_counts, start_week, end_week,
                 player_info_cache, projection_cache,
             )
-            simulation_count += 1
-
-            delta = sim["total"] - baseline_total
+            delta = sim["total"] - baseline
             if best_delta is None or delta > best_delta:
                 best_delta = delta
                 best_drop_info = repo.get_player_info(conn, drop_id, cache=player_info_cache)
@@ -83,14 +98,107 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
         })
 
     results.sort(key=lambda r: (r["projected_gain"] or float("-inf")), reverse=True)
-    results = results[:top_n]
+    return results[:top_n], baseline
+
+
+def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week: int,
+                  as_of_week: int = None, top_n: int = 10,
+                  fa_prefilter: int = DEFAULT_FA_PREFILTER, by_position: bool = False,
+                  fa_per_position: int = DEFAULT_FA_PER_POSITION) -> list:
+    total_start = time.perf_counter()
+    as_of_week = as_of_week or start_week
+
+    slot_counts = repo.get_slot_counts(conn, league_key)
+    current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
+
+    player_info_cache: dict = {}
+    projection_cache: dict = {}
+
+    fa_ids = _get_fa_pool(conn, league_key, as_of_week, start_week, end_week,
+                          fa_prefilter, by_position, fa_per_position)
+
+    results, _baseline = _search_pickups(
+        conn, league_key, current_ids, fa_ids, slot_counts, start_week, end_week,
+        player_info_cache, projection_cache, top_n=top_n,
+    )
 
     logger.debug(
-        "waiver search: %d free agents x %d roster spots = %d simulations in %.2fs",
-        len(fa_ids), len(current_ids), simulation_count, time.perf_counter() - total_start,
+        "waiver search: %d free agents x %d roster spots in %.2fs",
+        len(fa_ids), len(current_ids), time.perf_counter() - total_start,
     )
 
     return results
+
+
+def plan_waiver_moves(conn, league_key: str, team_id: int, start_week: int, end_week: int,
+                       as_of_week: int = None, fa_prefilter: int = DEFAULT_FA_PREFILTER,
+                       by_position: bool = False, fa_per_position: int = DEFAULT_FA_PER_POSITION,
+                       max_moves: int = 50) -> dict:
+    """
+    Greedily chain add/drop moves: find the single best move, apply it,
+    then search AGAIN against the resulting roster and a free agent
+    pool with that pickup removed - repeat until no move improves the
+    projected total (or max_moves is hit, a safety cap against a
+    pathological league, not something normally reached).
+
+    Each step re-simulates from scratch against the roster as it stands
+    AFTER every prior step, so step 2's answer already accounts for
+    step 1 having happened - unlike just calling best_pickups() once,
+    which always evaluates against your CURRENT real roster.
+
+    A player dropped in an earlier step is not reconsidered as a pickup
+    later in the same plan (no immediate buy-back) - only the free
+    agent pool shrinks as players get ADDED, not as they get dropped.
+    """
+    as_of_week = as_of_week or start_week
+    slot_counts = repo.get_slot_counts(conn, league_key)
+    current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
+    fa_pool = _get_fa_pool(conn, league_key, as_of_week, start_week, end_week,
+                            fa_prefilter, by_position, fa_per_position)
+
+    player_info_cache: dict = {}
+    projection_cache: dict = {}
+
+    starting_total = simulate_roster(
+        conn, league_key, current_ids, slot_counts, start_week, end_week,
+        player_info_cache, projection_cache,
+    )["total"]
+    running_total = starting_total
+
+    moves = []
+    for step in range(max_moves):
+        if not fa_pool:
+            break
+
+        top_results, baseline = _search_pickups(
+            conn, league_key, current_ids, fa_pool, slot_counts, start_week, end_week,
+            player_info_cache, projection_cache, top_n=1,
+        )
+        if not top_results or not top_results[0]["projected_gain"] or top_results[0]["projected_gain"] <= 0:
+            break  # no move left that actually helps - stop here
+
+        best = top_results[0]
+        add_id = best["add"]["player_id"]
+        drop_id = best["drop"]["player_id"]
+
+        current_ids = [pid for pid in current_ids if pid != drop_id] + [add_id]
+        fa_pool = [pid for pid in fa_pool if pid != add_id]
+        running_total = round(baseline + best["projected_gain"], 2)
+
+        moves.append({
+            "step": step + 1,
+            "add": best["add"],
+            "drop": best["drop"],
+            "gain": best["projected_gain"],
+            "running_total": running_total,
+        })
+
+    return {
+        "starting_total": round(starting_total, 2),
+        "final_total": round(running_total, 2),
+        "total_gain": round(running_total - starting_total, 2),
+        "moves": moves,
+    }
 
 
 def explain_pickup(conn, league_key: str, team_id: int, add_player_id: str, drop_player_id: str,

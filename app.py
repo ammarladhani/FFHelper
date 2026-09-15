@@ -86,15 +86,24 @@ with tab_standings:
 
 with tab_waiver:
     st.subheader(f"Best pickups for {my_team_label}")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     top_n = col1.slider("How many to show", 5, 50, 15, key="waiver_topn")
-    fa_prefilter = col2.slider("Free agents considered", 10, 100, 40, key="waiver_prefilter")
+    by_position = col2.checkbox("Search per-position", key="waiver_by_position",
+                                 help="Take the top N free agents at EACH position, instead of one "
+                                      "global top-N list that a deep position (WR) can flood out a "
+                                      "shallow one (QB/TE/K) from entirely.")
+    if by_position:
+        fa_limit = col3.slider("Free agents per position", 5, 30, 10, key="waiver_fa_per_position")
+    else:
+        fa_limit = col3.slider("Free agents considered", 10, 100, 40, key="waiver_prefilter")
 
     if st.button("Find pickups", key="waiver_btn"):
         with st.spinner("Testing every free agent against every roster spot..."):
             picks = waiver.best_pickups(
                 conn, league, my_team_id, start_week, end_week,
-                top_n=top_n, fa_prefilter=fa_prefilter,
+                top_n=top_n, by_position=by_position,
+                fa_per_position=fa_limit if by_position else waiver.DEFAULT_FA_PER_POSITION,
+                fa_prefilter=fa_limit if not by_position else waiver.DEFAULT_FA_PREFILTER,
             )
         st.session_state["waiver_picks"] = {"scope": scope_key, "data": picks}
 
@@ -125,6 +134,50 @@ with tab_waiver:
                 st.line_chart(chart_df)
                 st.dataframe(chart_df.reset_index(), hide_index=True, use_container_width=True)
         st.divider()
+
+    st.divider()
+    st.subheader("Plan sequential moves")
+    st.caption(
+        "Finds the single best add/drop, applies it, then searches again against "
+        "the resulting roster - repeating until no further move improves your total. "
+        "Answers 'after that first drop, what should I do next?' instead of just the "
+        "first move."
+    )
+
+    plan_scope_key = f"{scope_key}::{by_position}::{fa_limit}"
+
+    if st.button("Plan moves", key="waiver_plan_btn"):
+        with st.spinner("Chaining moves until nothing else helps... this can take a bit"):
+            plan = waiver.plan_waiver_moves(
+                conn, league, my_team_id, start_week, end_week,
+                by_position=by_position,
+                fa_per_position=fa_limit if by_position else waiver.DEFAULT_FA_PER_POSITION,
+                fa_prefilter=fa_limit if not by_position else waiver.DEFAULT_FA_PREFILTER,
+            )
+        st.session_state["waiver_plan"] = {"scope": plan_scope_key, "data": plan}
+
+    cached_plan = st.session_state.get("waiver_plan")
+    plan = cached_plan["data"] if cached_plan and cached_plan["scope"] == plan_scope_key else None
+    if not plan:
+        st.info("Click 'Plan moves' to search.")
+    elif not plan["moves"]:
+        st.write(f"Starting total: **{plan['starting_total']:.1f}** - no move found that improves it.")
+    else:
+        st.write(f"Starting total: **{plan['starting_total']:.1f}**  →  "
+                 f"Final total: **{plan['final_total']:.1f}**  "
+                 f"(total gain **+{plan['total_gain']:.1f}**)")
+        for m in plan["moves"]:
+            c1, c2, c3, c4 = st.columns([1, 3, 3, 2])
+            c1.write(f"**Step {m['step']}**")
+            c2.write(f"Add: {m['add']['name']}")
+            c3.write(f"Drop: {m['drop']['name']}")
+            c4.metric("Gain", f"+{m['gain']:.1f}")
+
+        totals_df = pd.DataFrame({
+            "Step": [0] + [m["step"] for m in plan["moves"]],
+            "Running total": [plan["starting_total"]] + [m["running_total"] for m in plan["moves"]],
+        }).set_index("Step")
+        st.line_chart(totals_df)
 
 # ---------------------------------------------------------- trade finder
 

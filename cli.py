@@ -37,6 +37,8 @@ def cmd_waiver(args, conn):
     results = waiver.best_pickups(
         conn, args.league, args.team, args.start_week, args.end_week,
         as_of_week=args.as_of_week, top_n=1000,
+        by_position=args.by_position, fa_per_position=args.fa_per_position,
+        fa_prefilter=args.prefilter,
     )
     print(f"\nTop pickups for team_id={args.team} (weeks {args.start_week}-{args.end_week}):\n")
     for r in results:
@@ -45,6 +47,24 @@ def cmd_waiver(args, conn):
         add_str = f"{add['name']} ({add['player_id']})" if add else "?"
         drop_str = f"{drop['name']} ({drop['player_id']})" if drop else "?"
         print(f"  +{r['projected_gain']:>6.1f}  add {add_str:<32} drop {drop_str}")
+
+
+def cmd_waiver_plan(args, conn):
+    plan = waiver.plan_waiver_moves(
+        conn, args.league, args.team, args.start_week, args.end_week,
+        as_of_week=args.as_of_week, fa_prefilter=args.prefilter,
+        by_position=args.by_position, fa_per_position=args.fa_per_position,
+        max_moves=args.max_moves,
+    )
+    print(f"\nWaiver plan for team_id={args.team} (weeks {args.start_week}-{args.end_week}):")
+    print(f"  Starting total: {plan['starting_total']:.1f}")
+    if not plan["moves"]:
+        print("  No move found that improves your projected total.")
+    for m in plan["moves"]:
+        add, drop = m["add"], m["drop"]
+        print(f"  Step {m['step']}: +{m['gain']:>6.1f}  add {add['name']:<28} "
+              f"drop {drop['name']:<28} -> running total {m['running_total']:.1f}")
+    print(f"  Final total: {plan['final_total']:.1f}  (total gain {plan['total_gain']:+.1f})")
 
 
 def cmd_trade_evaluate(args, conn):
@@ -147,11 +167,29 @@ def build_parser():
     add_common(p)
     p.set_defaults(func=cmd_simulate)
 
-    p = sub.add_parser("waiver")
+        p = sub.add_parser("waiver")
     add_common(p)
     p.add_argument("--team", type=int, required=True)
     p.add_argument("--top-n", type=int, dest="top_n", default=10)
+    p.add_argument("--prefilter", type=int, default=waiver.DEFAULT_FA_PREFILTER,
+                   help="free agents considered overall (ignored if --by-position)")
+    p.add_argument("--by-position", action="store_true",
+                   help="prefilter free agents per-position instead of one global ranked list")
+    p.add_argument("--fa-per-position", type=int, dest="fa_per_position",
+                   default=waiver.DEFAULT_FA_PER_POSITION,
+                   help="free agents considered per position, only used with --by-position")
     p.set_defaults(func=cmd_waiver)
+
+    p = sub.add_parser("waiver-plan")
+    add_common(p)
+    p.add_argument("--team", type=int, required=True)
+    p.add_argument("--prefilter", type=int, default=waiver.DEFAULT_FA_PREFILTER)
+    p.add_argument("--by-position", action="store_true")
+    p.add_argument("--fa-per-position", type=int, dest="fa_per_position",
+                   default=waiver.DEFAULT_FA_PER_POSITION)
+    p.add_argument("--max-moves", type=int, dest="max_moves", default=50,
+                   help="safety cap on chained moves - the search stops earlier on its own once no move helps")
+    p.set_defaults(func=cmd_waiver_plan)
 
     p = sub.add_parser("waiver-why")
     add_common(p)

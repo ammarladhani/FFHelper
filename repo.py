@@ -66,6 +66,38 @@ def get_free_agents_ranked(conn, league_key: str, as_of_week: int, start_week: i
     ).fetchall()
     return [r[0] for r in rows]
 
+def get_free_agents_ranked_by_position(conn, league_key: str, as_of_week: int, start_week: int,
+                                        end_week: int, limit_per_position: int = 10) -> list:
+    """
+    Like get_free_agents_ranked, but ranks and truncates SEPARATELY per
+    position before combining - e.g. top 10 free agent RBs + top 10 WRs +
+    top 10 QBs, etc., rather than one global top-N list that a deep
+    position (WR) can flood out a shallow one (QB, TE, K) from entirely.
+    """
+    rows = conn.execute(
+        """
+        SELECT o.player_id, p.position, SUM(COALESCE(pr.projected_points, 0)) AS total
+        FROM ownership o
+        JOIN players p ON p.player_id = o.player_id
+        LEFT JOIN projections pr
+          ON pr.league_key = o.league_key
+         AND pr.player_id = o.player_id
+         AND pr.week BETWEEN ? AND ?
+        WHERE o.league_key = ? AND o.team_id IS NULL AND o.week = ?
+        GROUP BY o.player_id, p.position
+        ORDER BY p.position, total DESC
+        """,
+        (start_week, end_week, league_key, as_of_week),
+    ).fetchall()
+
+    by_position: dict = {}
+    for player_id, position, _total in rows:
+        by_position.setdefault(position, []).append(player_id)
+
+    combined = []
+    for ids in by_position.values():
+        combined.extend(ids[:limit_per_position])
+    return combined
 
 # player_id is always TEXT (platform-prefixed, e.g. "espn_4046692" or
 # "sleeper_4984" - the latter sometimes non-numeric, e.g. "sleeper_BUF").

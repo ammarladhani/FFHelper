@@ -120,3 +120,16 @@ def test_trade_evaluate(conn):
     )
     assert "team_a" in result and "team_b" in result
     assert result["team_a"]["delta"] == pytest.approx(result["team_a"]["after"] - result["team_a"]["before"])
+
+def test_get_free_agents_ranked_by_position(conn):
+    ids = repo.get_free_agents_ranked_by_position(conn, LEAGUE, as_of_week=1, start_week=1, end_week=2, limit_per_position=1)
+    assert "p_fa1" in ids  # top RB free agent
+    assert "p_fa2" in ids  # top (only) QB free agent - wouldn't survive a global top-1 cut
+
+
+def test_plan_waiver_moves_chains_until_no_gain(conn):
+    plan = waiver.plan_waiver_moves(conn, LEAGUE, team_id=1, start_week=1, end_week=2)
+    assert len(plan["moves"]) == 1  # only p_fa1/p_bn1 is a real upgrade here
+    assert plan["moves"][0]["add"]["player_id"] == "p_fa1"
+    assert plan["moves"][0]["drop"]["player_id"] == "p_bn1"
+    assert plan["total_gain"] > 0
