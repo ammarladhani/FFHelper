@@ -173,3 +173,40 @@ def upsert_ownership(conn, league_key, player_id, week, team_id, reserved=None):
         "team_id=excluded.team_id, reserved=excluded.reserved",
         (league_key, player_id, week, team_id, reserved),
     )
+
+
+def move_player(conn, league_key: str, player_id: str, new_team_id, from_week: int) -> int:
+    """
+    Manually reassign a player to a different team (or to free agency,
+    if new_team_id is None) starting at from_week and for every later
+    week already sitting in the ownership table.
+
+    This is a local-only override for the "move a player" UI control in
+    app.py's Rosters tab - it doesn't talk to ESPN/Sleeper at all, it
+    just edits the ownership rows that simulator.py/waiver.py/trades.py
+    already read from. It intentionally updates every week >= from_week
+    (not just one), since the whole point is to change what the season
+    simulation assumes the roster looks like going forward - a single
+    week's ownership row wouldn't affect any of those season totals.
+
+    Clears any IR/Taxi `reserved` flag on the affected rows: a manual
+    move is by definition putting the player on an active roster spot
+    (or off the roster entirely, for free agency), not into a reserved
+    slot - there's no UI for reserving a player, only for moving one.
+
+    NOTE: this is overwritten the next time `ingest.py` runs, since
+    ingestion re-derives real ownership from the platform for every
+    ingested week. That's expected - this is a scratch/what-if edit,
+    not a substitute for actually making the move on ESPN/Sleeper.
+
+    Returns the number of ownership rows updated (0 usually means
+    from_week is later than every ingested week for this league, or
+    the player has no ownership rows in this league at all).
+    """
+    cur = conn.execute(
+        "UPDATE ownership SET team_id = ?, reserved = NULL "
+        "WHERE league_key = ? AND player_id = ? AND week >= ?",
+        (new_team_id, league_key, player_id, from_week),
+    )
+    conn.commit()
+    return cur.rowcount

@@ -167,7 +167,7 @@ def build_parser():
     add_common(p)
     p.set_defaults(func=cmd_simulate)
 
-        p = sub.add_parser("waiver")
+    p = sub.add_parser("waiver")
     add_common(p)
     p.add_argument("--team", type=int, required=True)
     p.add_argument("--top-n", type=int, dest="top_n", default=10)

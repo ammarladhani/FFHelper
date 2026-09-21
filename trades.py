@@ -13,7 +13,8 @@ the combinatorics sane - see `candidate_prefilter`.
 """
 
 from itertools import combinations
-
+from math import comb
+import math
 import repo
 from simulator import simulate_roster
 
@@ -56,12 +57,13 @@ def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
 # candidate_prefilter note below) - default to 1-for-1 only, same as
 # the README documents. Pass combo_sizes=(1, 2) explicitly, with a
 # smaller candidate_prefilter, if you want the wider (slower) search.
-DEFAULT_COMBO_SIZES = (1,)
+DEFAULT_COMBO_SIZES = (1,2)
 
 
 def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_week: int,
                     as_of_week: int = None, candidate_prefilter: int = 12,
-                    combo_sizes=DEFAULT_COMBO_SIZES, partner_team_id: int = None) -> list:
+                    combo_sizes=DEFAULT_COMBO_SIZES, partner_team_id: int = None,
+                    progress_callback=None) -> list:
     """
     Search win-win 1-for-1 (and optionally larger, via combo_sizes)
     trades between my_team_id and every other team in the league - or,
@@ -109,6 +111,38 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
         player_info_cache, projection_cache,
     )["total"]
 
+    # First pass: figure out each opposing team's candidate pool up front
+    # (cheap - just SQL + sorting, no simulation) so we can both (a) reuse
+    # it in the real search below without recomputing it, and (b) total up
+    # how many (my_combo, other_combo) pairs will be tried overall, which
+    # is what makes a meaningful progress bar possible.
+    team_data = {}
+    total_combos = 0
+    for team in teams:
+        other_id = team["team_id"]
+        if other_id == my_team_id:
+            continue
+        other_ids_full = repo.get_roster_player_ids(conn, league_key, other_id, as_of_week)
+        other_reserved = repo.get_reserved_player_ids(conn, league_key, other_id, as_of_week)
+        other_tradeable_ids = [pid for pid in other_ids_full if pid not in other_reserved]
+        other_candidates = _top_players_by_rest_of_season(
+            conn, league_key, other_tradeable_ids, start_week, end_week, candidate_prefilter,
+        )
+        team_data[other_id] = (other_ids_full, other_candidates)
+
+        for size in combo_sizes:
+            if len(my_candidates) >= size and len(other_candidates) >= size:
+                total_combos += comb(len(my_candidates), size) * comb(len(other_candidates), size)
+
+    # Call the callback roughly 100-200 times over the whole search rather
+    # than on every combo, which would dominate runtime with UI updates.
+    update_every = max(1, total_combos // 150)
+    considered = 0
+
+    def _report(force=False):
+        if progress_callback and (force or considered % update_every == 0):
+            progress_callback(considered, total_combos)
+
     proposals = []
 
     for team in teams:
@@ -116,12 +150,7 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
         if other_id == my_team_id:
             continue
 
-        other_ids_full = repo.get_roster_player_ids(conn, league_key, other_id, as_of_week)
-        other_reserved = repo.get_reserved_player_ids(conn, league_key, other_id, as_of_week)
-        other_tradeable_ids = [pid for pid in other_ids_full if pid not in other_reserved]
-        other_candidates = _top_players_by_rest_of_season(
-            conn, league_key, other_tradeable_ids, start_week, end_week, candidate_prefilter,
-        )
+        other_ids_full, other_candidates = team_data[other_id]
         other_baseline = simulate_roster(
             conn, league_key, other_ids_full, slot_counts, start_week, end_week,
             player_info_cache, projection_cache,
@@ -132,6 +161,9 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
                 new_a_ids = [pid for pid in my_ids_full if pid not in my_combo]
 
                 for other_combo in combinations(other_candidates, size):
+                    considered += 1
+                    _report()
+
                     trial_a_ids = new_a_ids + list(other_combo)
                     new_a_total = simulate_roster(
                         conn, league_key, trial_a_ids, slot_counts, start_week, end_week,
@@ -159,7 +191,9 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
                         "partner_delta": partner_delta,
                     })
 
-    proposals.sort(key=lambda p: p["my_delta"], reverse=True)
+    _report(force=True)  # make sure the caller sees 100% at the end
+
+    proposals.sort(key=lambda p: math.sqrt(p["my_delta"] * p["partner_delta"]), reverse=True)
     return proposals
 
 

@@ -12,12 +12,20 @@ import streamlit as st
 
 import config
 import db
+import ingest
 import repo
 import simulator
 import waiver
 import trades
 
 st.set_page_config(page_title="Fantasy Optimizer", page_icon="🏈", layout="wide")
+
+FREE_AGENCY_LABEL = "🆓 Free Agency"
+
+# Session/result caches that go stale the moment ownership changes -
+# either from the manual "move a player" control or from re-running
+# ingest.py - so both of those clear this list before rerunning.
+STALE_ON_ROSTER_CHANGE = ("waiver_picks", "waiver_plan", "trade_proposals")
 
 
 @st.cache_resource
@@ -56,6 +64,23 @@ my_team_id = team_labels[my_team_label]
 
 start_week, end_week = st.sidebar.slider("Week range", 1, 18, (1, 18))
 st.sidebar.caption(f"League key: `{league}` · Team ID: `{my_team_id}`")
+
+st.sidebar.divider()
+if st.sidebar.button("🔄 Refresh data (run ingest.py)",
+                      help="Re-pulls every league's teams, settings, rosters, and weekly "
+                           "projections from ESPN/Sleeper. Takes a few minutes per league. "
+                           "This overwrites any manual moves made in the Rosters tab, since "
+                           "it re-derives real ownership from the platform."):
+    with st.spinner("Running ingest.py - this can take a few minutes per league..."):
+        try:
+            ingest.main()
+        except Exception as e:
+            st.sidebar.error(f"Ingest failed: {e}")
+        else:
+            for key in STALE_ON_ROSTER_CHANGE:
+                st.session_state.pop(key, None)
+            st.sidebar.success("Data refreshed.")
+            st.rerun()
 
 # Results are cached in session_state so they survive re-runs from other
 # widgets, but they need to be keyed by (league, team, week range) -
@@ -192,18 +217,29 @@ with tab_trade_finder:
     partner_team_id = partner_labels[partner_choice]
 
     c1, c2, c3 = st.columns(3)
-    prefilter = c1.slider("Search depth (prefilter)", 4, 16, 12, key="trade_prefilter")
-    top_n = c2.slider("Show top N", 5, 50, 10, key="trade_topn")
+    prefilter = c1.slider("Search depth (prefilter)", 4, 25, 12, key="trade_prefilter")
+    top_n = c2.slider("Show top N", 5, 500, 10, key="trade_topn")
     c3.caption("Higher search depth = slower but more thorough")
 
     trade_scope_key = f"{scope_key}::{partner_team_id}::{prefilter}"
 
     if st.button("Find trades", key="trade_btn"):
-        with st.spinner("Searching for win-win trades... this can take a bit"):
-            all_proposals = trades.suggest_trades(
-                conn, league, my_team_id, start_week, end_week,
-                candidate_prefilter=prefilter, partner_team_id=partner_team_id,
-            )
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        def _update_progress(considered, total):
+            pct = min(considered / total, 1.0) if total else 1.0
+            progress_bar.progress(pct)
+            status_text.caption(f"Considered {considered:,} of {total:,} trade combinations...")
+
+        all_proposals = trades.suggest_trades(
+            conn, league, my_team_id, start_week, end_week,
+            candidate_prefilter=prefilter, partner_team_id=partner_team_id,
+            progress_callback=_update_progress,
+        )
+
+        progress_bar.empty()
+        status_text.empty()
         st.session_state["trade_proposals"] = {"scope": trade_scope_key, "data": all_proposals}
 
     cached = st.session_state.get("trade_proposals")
@@ -311,3 +347,64 @@ with tab_rosters:
             for p in players
         ]).sort_values("Projected", ascending=False, na_position="last")
         st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Move a player")
+    st.caption(
+        "Reassigns a player straight in the local database - your team to another team's, "
+        "another team's to yours, or anyone to/from free agency. This is a manual override "
+        "for testing 'what if' scenarios (or fixing a roster ingest.py hasn't caught up on "
+        "yet, e.g. a same-day waiver claim) - it does NOT touch ESPN/Sleeper, and the next "
+        "'Refresh data' run will overwrite it with whatever the platform actually shows."
+    )
+
+    move_team_labels = {FREE_AGENCY_LABEL: None, **team_labels}
+    move_label_list = list(move_team_labels.keys())
+
+    move_effective_week = st.number_input(
+        "Effective from week", min_value=1, max_value=18, value=int(start_week), key="move_effective_week",
+        help="Applies to this week and every later week already in the database - i.e. it "
+             "changes the roster for the rest of the season's simulations, not just one "
+             "week's snapshot.",
+    )
+
+    mc1, mc2 = st.columns(2)
+    from_label = mc1.selectbox("From", move_label_list, key="move_from_team")
+    from_team_id = move_team_labels[from_label]
+
+    if from_team_id is None:
+        from_player_ids = repo.get_free_agent_ids(conn, league, move_effective_week)
+    else:
+        from_player_ids = repo.get_roster_player_ids(conn, league, from_team_id, move_effective_week)
+
+    from_player_names = {}
+    for pid in from_player_ids:
+        info = repo.get_player_info(conn, pid)
+        if info:
+            from_player_names[f"{info['name']} ({info['position'] or '?'})"] = pid
+
+    if not from_player_names:
+        mc1.info("No players found there for that week.")
+    else:
+        player_label = mc1.selectbox("Player", sorted(from_player_names.keys()), key="move_player_select")
+        player_id = from_player_names[player_label]
+
+        to_options = [lbl for lbl in move_label_list if lbl != from_label]
+        to_label = mc2.selectbox("To", to_options, key="move_to_team")
+        to_team_id = move_team_labels[to_label]
+
+        if st.button("Move player", key="move_player_btn"):
+            rows_updated = db.move_player(conn, league, player_id, to_team_id, int(move_effective_week))
+            if rows_updated == 0:
+                st.warning(
+                    f"No ownership rows updated - is week {move_effective_week} within the "
+                    "range covered by ingest.py for this league?"
+                )
+            else:
+                for key in STALE_ON_ROSTER_CHANGE:
+                    st.session_state.pop(key, None)
+                st.success(
+                    f"Moved {player_label.split(' (')[0]} from {from_label} to {to_label}, "
+                    f"effective week {move_effective_week}."
+                )
+                st.rerun()
