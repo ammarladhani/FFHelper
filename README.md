@@ -1,6 +1,6 @@
 # Fantasy football optimizer
 
-Pulls fantasy football projections + rosters (ESPN and/or Sleeper), then answers:
+Pulls fantasy football projections + rosters (ESPN, Sleeper, and/or Yahoo), then answers:
 
 - What's every team projected to score, week by week and for the rest of the season?
 - Which free agent should I (or my girlfriend) pick up right now to maximize that projection?
@@ -8,10 +8,10 @@ Pulls fantasy football projections + rosters (ESPN and/or Sleeper), then answers
 - If I propose a specific trade, what does it actually do to both teams?
 - *Why* does a given pickup or trade help - week by week, before vs after?
 
-Supports multiple leagues at once, across platforms - e.g. an ESPN IDP league and a
-separate Sleeper league, tracked side by side in the same local database. Usable
-either as a CLI (`cli.py`) or a local web UI (`app.py`) - both call the same
-backend, so pick whichever fits the moment.
+Supports multiple leagues at once, across platforms - e.g. an ESPN IDP league, a
+Sleeper league, and a Yahoo league, all tracked side by side in the same local
+database. Usable either as a CLI (`cli.py`) or a local web UI (`app.py`) - both
+call the same backend, so pick whichever fits the moment.
 
 ## Setup
 
@@ -19,15 +19,48 @@ backend, so pick whichever fits the moment.
 pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and fill in your ESPN session cookies (pull fresh
-from browser dev tools: Network tab -> any fantasy.espn.com request -> Cookies).
-**These are live credentials for your ESPN account - `.env` is gitignored and
-should never be committed.** `config.py` itself has no secrets in it and is safe
-to share/commit.
+Copy `.env.example` to `.env` and fill in credentials for whichever platform(s)
+you're using. `config.py` itself has no secrets in it and is safe to share/commit.
 
-Sleeper leagues need only a `league_id` in `config.py` (from the URL when
+**ESPN** needs your session cookies (pull fresh from browser dev tools: Network
+tab -> any fantasy.espn.com request -> Cookies). **These are live credentials
+for your ESPN account - `.env` is gitignored and should never be committed.**
+
+**Sleeper** leagues need only a `league_id` in `config.py` (from the URL when
 viewing your league on sleeper.com, e.g. `sleeper.com/leagues/<LEAGUE_ID>`) -
 Sleeper's read API is fully public, no cookies or login needed at all.
+
+**Yahoo** needs OAuth2, not a cookie - it's the one platform here where "logged
+into your browser" isn't enough. One-time setup:
+1. Register an app at [developer.yahoo.com/apps](https://developer.yahoo.com/apps/) -
+   any name, then under "API Permissions" check **Fantasy Sports** with Read
+   access. The redirect URI you put doesn't matter (this tool uses Yahoo's
+   out-of-band flow, not a callback server) - `https://localhost:8080` is fine.
+2. Grab the **Client ID** and **Client Secret** Yahoo shows on the app's page.
+3. Run `python get_yahoo_token.py`, paste those two values in when asked, and
+   follow the browser prompt to authorize the app. It prints three lines to
+   put in `.env`: `YAHOO_CLIENT_ID`, `YAHOO_CLIENT_SECRET`, `YAHOO_REFRESH_TOKEN`.
+4. Fill in `league_id` in `config.py` (the numeric ID from your league's URL)
+   and set `"scoring"` to match your league (see the note in `config.py` -
+   Yahoo doesn't expose reception scoring in a form we're confident
+   auto-parsing, so this is one place you tell it rather than it guessing).
+
+One Yahoo account's OAuth credentials cover every Yahoo league you're in under
+that account - you don't need to repeat setup per league, just add another
+entry to `LEAGUES` with the same `client_id`/`client_secret`/`refresh_token`
+and a different `league_id`.
+
+> **Yahoo doesn't give you real weekly player projections.** Unlike ESPN and
+> Sleeper, Yahoo's official API has no per-player, future-week "projected
+> points" field - what you see on Yahoo's website comes from licensed
+> projection partners that aren't exposed through the API. This tool works
+> around that by borrowing Sleeper's public projections and matching players
+> across platforms via Sleeper's `yahoo_id` cross-reference field (see
+> `yahoo_projections.py`). Everything else for Yahoo - rosters, ownership,
+> league settings, positions - comes straight from Yahoo. In practice this
+> means Yahoo-league recommendations are only as good as the cross-platform
+> player match, which is very good for standard rosters and can miss a rare
+> deep-bench player Sleeper doesn't track under a matching `yahoo_id`.
 
 Leave `my_team_id` as `None` for now - you'll fill it in after the first run.
 
@@ -39,19 +72,24 @@ python ingest.py
 
 This pulls every week's projections + ownership + league settings + player slot
 eligibility into a local SQLite file (`fantasy.db`), for every league listed in
-`config.py`. It'll take a few minutes per league for a full season. `fantasy.db`
-is gitignored - it's derived data, regenerate it locally rather than committing it.
+`config.py`. It'll take a few minutes per league for a full season - Yahoo leagues
+take a bit longer on the very first run specifically, since (unlike ESPN/Sleeper)
+Yahoo's full player list has to be paginated 25-at-a-time across the league's
+entire player pool once up front (see `yahoo_client.fetch_all_players`'s
+docstring); after that first pull it's cached and each week's ingest is fast.
 
-> If you're upgrading from a version of this tool from before Sleeper support: the
-> database schema changed (`player_id` is now text instead of a number, since
-> Sleeper uses string IDs - even non-numeric ones like `"BUF"` for a defense).
-> Run `python reset_db.py` and then `python ingest.py` fresh.
+> If you're upgrading from a version of this tool from before Sleeper/Yahoo
+> support: the database schema changed (`player_id` is now text instead of a
+> number, since Sleeper/Yahoo use string IDs - even non-numeric ones like
+> Sleeper's `"BUF"` for a defense). Run `python reset_db.py` and then
+> `python ingest.py` fresh.
 
 Then find your team ID for each league:
 
 ```
 python cli.py list-teams --league my_league
 python cli.py list-teams --league sleeper_league
+python cli.py list-teams --league yahoo_league
 ```
 
 Fill those into `config.py`'s `my_team_id` if you want, or just pass `--team` on the
@@ -154,22 +192,35 @@ that touches `simulator.py`, `repo.py`, `waiver.py`, or `trades.py`.
 
 ## How it works
 
-- `espn_client.py` / `sleeper_client.py` - talk to each platform's API. ESPN needs
-  auth cookies (from `.env`, see Setup); Sleeper is public read-only. Both
-  normalize into the same shape before hitting the database.
+- `espn_client.py` / `sleeper_client.py` / `yahoo_client.py` - talk to each
+  platform's API. ESPN needs auth cookies (from `.env`, see Setup); Sleeper is
+  public read-only; Yahoo needs OAuth2 (see Setup, and `get_yahoo_token.py`).
+  All three normalize into the same shape before hitting the database.
+- `yahoo_projections.py` - Yahoo's API has no per-player future-week
+  projections (see the callout in Setup above), so this borrows Sleeper's
+  public projections and cross-references players by Sleeper's `yahoo_id`
+  field. Only used for Yahoo leagues; ESPN and Sleeper get real projections
+  straight from their own APIs.
+- `get_yahoo_token.py` - one-time interactive OAuth setup for a Yahoo account;
+  prints the three values (`YAHOO_CLIENT_ID`/`YAHOO_CLIENT_SECRET`/
+  `YAHOO_REFRESH_TOKEN`) to put in `.env`. `debug_yahoo_raw.py` dumps a raw
+  Yahoo API response for a given league/resource if `yahoo_client.py`'s
+  parsing of Yahoo's JSON shape ever needs adjusting.
 - `db.py` / `repo.py` - SQLite storage and read queries. Player IDs are stored
-  prefixed by platform (`espn_4046692`, `sleeper_4984`) since the two platforms use
-  completely separate, non-comparable ID spaces - without the prefix, an ID could
-  theoretically collide between an ESPN player and an unrelated Sleeper player.
-  `repo.py`'s player-info/roster lookups accept an optional shared cache dict so
-  `waiver.py`/`trades.py` searches (which re-simulate the same handful of players
-  over and over across candidate rosters) don't round-trip to SQLite for
-  information that hasn't changed between calls.
+  prefixed by platform (`espn_4046692`, `sleeper_4984`, `yahoo_30123`) since
+  each platform uses completely separate, non-comparable ID spaces - without
+  the prefix, an ID could theoretically collide between two unrelated players
+  on different platforms. `repo.py`'s player-info/roster lookups accept an
+  optional shared cache dict so `waiver.py`/`trades.py` searches (which
+  re-simulate the same handful of players over and over across candidate
+  rosters) don't round-trip to SQLite for information that hasn't changed
+  between calls.
 - Player slot eligibility (`eligible_slots`) is stored as a list of **slot name
   strings** (e.g. `["DT", "DL", "DP", "BE"]`), not platform-specific numeric codes -
-  this is what lets one `lineup_optimizer.py` work for both platforms. ESPN's
-  numeric `eligibleSlots` IDs are converted to names at ingestion time; Sleeper's
-  `fantasy_positions` are already plain strings natively.
+  this is what lets one `lineup_optimizer.py` work across all three platforms.
+  ESPN's numeric `eligibleSlots` IDs are converted to names at ingestion time;
+  Sleeper's `fantasy_positions` and Yahoo's `eligible_positions` are both
+  already plain strings natively.
 - `lineup_optimizer.py` - given a roster, solves for the best legal starting lineup
   for one week as an optimal assignment problem (`scipy.optimize.linear_sum_assignment`)
   over player eligibility, rather than filling slots greedily. This matters most for
@@ -196,6 +247,7 @@ that touches `simulator.py`, `repo.py`, `waiver.py`, or `trades.py`.
   can rebuild it from scratch after a schema change.
 - `debug_sleeper_projections.py` - probes Sleeper's unofficial projections
   endpoint if `sleeper_client.py`'s parsing ever starts breaking (see below).
+  `debug_yahoo_raw.py` is the Yahoo equivalent.
 
 ## Known rough edges / things to double check on first run
 
@@ -221,7 +273,33 @@ that touches `simulator.py`, `repo.py`, `waiver.py`, or `trades.py`.
   own default bracket assumptions (FG distance tiers, points-allowed tiers), which
   may not exactly match your league's custom settings. Worth spot-checking one K
   and one DEF projection against what the Sleeper app itself shows.
-- Flex-style slots (`FLEX`, `RB/WR`, `OP`, Sleeper's `SUPER_FLEX`, etc.) are matched
-  by the player's own position rather than `eligible_slots`, since these are league
-  lineup categories rather than a real eligibility slot on either platform. Fine
-  for standard RB/WR/TE flex; worth double-checking for unusual flex types.
+- **Yahoo has no real per-player weekly projections via its official API** - see
+  the callout in Setup. This tool bridges in Sleeper's projections by matching on
+  Sleeper's `yahoo_id` field, which covers standard rostered players well but can
+  miss an obscure deep-bench player. Worth spot-checking a couple of your Yahoo
+  roster's projected points against what Sleeper itself shows for the same
+  players, same spirit as the Sleeper K/DEF check above.
+- **Yahoo's reception scoring isn't auto-detected** - unlike Sleeper, where a
+  league's `rec` value is read straight from the API, Yahoo's scoring-settings
+  response doesn't expose this in a form we're confident parsing automatically.
+  Set `"scoring"` in `config.py`'s Yahoo league entry by hand to match your
+  league (it feeds directly into the same `choose_points_field` logic Sleeper
+  leagues use, since Yahoo projections are borrowed from Sleeper).
+- **Yahoo occasionally rotates its refresh_token on a refresh call.**
+  `yahoo_client.py` prints a warning with the new value if this happens, since
+  continuing to refresh from the old (now possibly-invalidated) one could break
+  ingestion. Rare, but if a Yahoo league starts failing auth, check the console
+  output from your last `ingest.py` run for that warning.
+- Yahoo's official REST API guide is stale/archived (the community docs it's
+  based on date to 2013) - `yahoo_client.py`'s JSON parsing is built from that
+  plus common usage patterns rather than an authoritative current spec. If
+  something doesn't parse right, `debug_yahoo_raw.py` dumps the raw response
+  for a given league/resource so you can see exactly what changed.
+- Flex-style slots (`FLEX`, `RB/WR`, `OP`, Sleeper's `SUPER_FLEX`, Yahoo's
+  `W/R/T`/`W/T`/`Q/W/R/T`, etc.) are matched by the player's own position rather
+  than `eligible_slots`, since these are league lineup categories rather than a
+  real eligibility slot on any platform. Fine for standard RB/WR/TE flex; worth
+  double-checking for unusual flex types, especially on Yahoo where an
+  uncommon flex code might not be in `config.FLEX_SLOT_ELIGIBILITY` yet - add
+  it there if `lineup_optimizer.py` seems to be benching someone who should be
+  flex-eligible.

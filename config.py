@@ -1,6 +1,7 @@
 """
 Configuration for all leagues the system should track - across
-platforms. Each entry needs a "platform" key: "espn" or "sleeper".
+platforms. Each entry needs a "platform" key: "espn", "sleeper", or
+"yahoo".
 
 ESPN entries need SWID/espn_s2 session cookies (pull fresh from
 browser dev tools: Network tab -> any fantasy.espn.com request ->
@@ -13,26 +14,15 @@ Sleeper entries need only a league_id - Sleeper's read API is public,
 no auth required. Find your league_id in the URL when viewing your
 league on sleeper.com, e.g. sleeper.com/leagues/<LEAGUE_ID>.
 
-Per-league season structure (all platforms):
-
-    end_week        Last week of the fantasy season, INCLUDING playoffs
-                    (ESPN league: 18, Sleeper league: 16). Ingestion, the
-                    week slider, and the CLI defaults all stop here.
-    playoff_teams   How many teams make the playoffs.
-    playoff_weeks   How many weeks the playoffs last. The regular season is
-                    therefore weeks 1 .. (end_week - playoff_weeks).
-    schedule        OPTIONAL manual override of the regular-season schedule,
-                    {week: [(team_id, team_id), ...]}. Normally leave this out
-                    - ingest.py pulls the real schedule (and actual scores for
-                    finished weeks) from ESPN/Sleeper automatically.
-
-playoff_teams / playoff_weeks are what the projected-records / champion
-view needs. They are left as None below on purpose: fill in YOUR leagues'
-real values rather than trusting a guess.
+Yahoo entries need a Yahoo app's client_id/client_secret plus a
+refresh_token obtained via a one-time OAuth flow - see the README's
+Yahoo setup section, or just run `python get_yahoo_token.py`. Unlike
+ESPN/Sleeper, Yahoo's OAuth credentials are per-Yahoo-ACCOUNT, not
+per-league - if all your Yahoo leagues are under one Yahoo account,
+they all share the same client_id/client_secret/refresh_token.
 """
 
 import os
-from datetime import date
 
 from dotenv import load_dotenv
 
@@ -48,47 +38,36 @@ LEAGUES = [
         "swid": os.environ.get("ESPN_SWID_MY_LEAGUE", ""),
         "espn_s2": os.environ.get("ESPN_S2_MY_LEAGUE", ""),
         "my_team_id": 11,
-        "end_week": 18,
-        "playoff_teams": 8,          # TODO: fill in (e.g. 6)
-        "playoff_weeks": 3,          # TODO: fill in (e.g. 3)
     },
     {
         "platform": "sleeper",
         "name": "sleeper_league",
         "league_id": "1322365155329216512",
         "my_team_id": 3,            # fill in with your roster_id after list-teams
-        "end_week": 16,
-        "playoff_teams": 6,          # TODO: fill in (e.g. 6)
-        "playoff_weeks": 3,          # TODO: fill in (e.g. 3)
+    },
+    {
+        "platform": "yahoo",
+        "name": "yahoo_league",
+        "league_id": "123456",     # numeric league_id from your league's URL (not the game_key - that's resolved automatically per-season)
+        "client_id": os.environ.get("YAHOO_CLIENT_ID", ""),
+        "client_secret": os.environ.get("YAHOO_CLIENT_SECRET", ""),
+        "refresh_token": os.environ.get("YAHOO_REFRESH_TOKEN", ""),
+        # Yahoo's league-settings API doesn't expose reception scoring in
+        # a shape we're confident auto-parsing (undocumented stat_id
+        # numbers - same "verify it yourself" territory as Sleeper's K/DEF
+        # scoring below). Set this to match your league instead of
+        # guessing - it's fed straight into sleeper_client.choose_points_field,
+        # since Yahoo projections are borrowed from Sleeper (see
+        # yahoo_projections.py): 1 = full PPR, 0.5 = half PPR, 0 = standard.
+        "scoring": {"rec": 1},
+        "my_team_id": None,        # fill in with your team_id after list-teams
     },
 ]
 
 START_WEEK = 1
-# Fallback last week for any league entry that doesn't set its own "end_week".
 END_WEEK = 18
 
 DB_PATH = "fantasy.db"
-
-# The SUNDAY on which "week 1" begins. The current week rolls over at
-# midnight every Sunday from here: 9/6 -> week 1, 9/13 -> week 2,
-# 9/20 -> week 3, ... Used to default the week slider to "this week".
-WEEK_1_START = date(2026, 9, 6)
-
-# Recency weighting: a week `n` weeks after the first week in the
-# selected range counts for DEFAULT_DECAY ** n of a week-0 point.
-# 0.9 -> each week further out is worth 90% of the one before it.
-DEFAULT_DECAY = 0.9
-
-# Monte Carlo win-probability simulation (see win_probability.py). Ingestion
-# only stores a point PROJECTION per team-week, not any measure of how much
-# that projection has actually varied historically - there's no real
-# week-to-week variance data to calibrate against. So a team's score in a
-# not-yet-played week is modeled there as Normal(mean=projection,
-# stdev=DEFAULT_SCORE_STD_FRACTION * mean), a simplifying, adjustable
-# assumption rather than a fitted model. 0.20 is a reasonable fantasy
-# football ballpark (raise it for more upsets/less confident favorites).
-DEFAULT_SCORE_STD_FRACTION = 0.20
-DEFAULT_N_SIMS = 2000
 
 
 def require_espn_credentials():
@@ -107,6 +86,21 @@ def require_espn_credentials():
                 "see the README for how to pull them from your browser."
             )
 
+
+def require_yahoo_credentials():
+    """Same idea as require_espn_credentials(), for Yahoo's OAuth creds.
+    Called from ingest.py right before a Yahoo league is actually hit."""
+    for league in LEAGUES:
+        if league["platform"] == "yahoo" and not (
+            league.get("client_id") and league.get("client_secret") and league.get("refresh_token")
+        ):
+            raise RuntimeError(
+                f"League '{league['name']}' is a Yahoo league but its OAuth credentials "
+                "are missing. Run `python get_yahoo_token.py` once to register a Yahoo app "
+                "and get a refresh_token, then fill YAHOO_CLIENT_ID / YAHOO_CLIENT_SECRET / "
+                "YAHOO_REFRESH_TOKEN into .env - see the README for the full walkthrough."
+            )
+
 # ESPN's default lineup slot ID -> readable name (standard mapping used
 # across ESPN fantasy API tooling).
 SLOT_MAP = {
@@ -116,15 +110,9 @@ SLOT_MAP = {
     20: "BE", 21: "IR", 22: "", 23: "FLEX", 24: "EDR", 25: "Rookie",
 }
 
-# Slot names that lock a player onto a roster - the manager can leave
-# them there, but the automated waiver/trade tooling shouldn't treat
-# them as free to drop/trade the way a normal bench player is.
-# Distinct from NON_STARTING_SLOTS: BE is also non-scoring but IS
-# freely droppable.
-RESERVED_SLOT_NAMES = {"IR", "TAXI"}
-
-# Player's default position ID -> readable name (ESPN only - Sleeper
-# reports position as a plain string natively, no ID lookup needed).
+# Player's default position ID -> readable name (ESPN only - Sleeper and
+# Yahoo both report position as a plain string natively, no ID lookup
+# needed).
 # ESPN uses two separate numbering schemes that happen not to collide:
 # offensive positions (+ D/ST) use one set of codes, individual defensive
 # player (IDP) positions use another. Both are needed for IDP leagues.
@@ -147,6 +135,14 @@ FLEX_SLOT_ELIGIBILITY = {
     "WR/TE": {"WR", "TE"},
     "OP": {"QB", "RB", "WR", "TE"},
     "SUPER_FLEX": {"QB", "RB", "WR", "TE"},  # Sleeper's superflex slot name
+    # Yahoo's flex-slot codes come through eligible_positions/roster
+    # position names verbatim (no numeric-ID translation needed, unlike
+    # ESPN) - these are the common ones. Worth double-checking against
+    # your own league's roster settings if you use an unusual flex type
+    # Yahoo names differently.
+    "W/R/T": {"WR", "RB", "TE"},
+    "W/T": {"WR", "TE"},
+    "Q/W/R/T": {"QB", "WR", "RB", "TE"},
 }
 
 # Slot names that never count toward a team's scoring lineup.

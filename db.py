@@ -49,21 +49,7 @@ CREATE TABLE IF NOT EXISTS ownership (
     player_id    TEXT NOT NULL,
     week         INTEGER NOT NULL,
     team_id      INTEGER,
-    reserved     TEXT,  -- 'IR' / 'TAXI' / NULL (normal active roster spot)
     PRIMARY KEY (league_key, player_id, week)
-);
-
--- Regular-season head-to-head matchups. One row per matchup (byes have no
--- row). score_a/score_b are ACTUAL final scores for weeks that have already
--- been played, NULL for weeks still to come (those get projected instead).
-CREATE TABLE IF NOT EXISTS schedule (
-    league_key   TEXT NOT NULL,
-    week         INTEGER NOT NULL,
-    team_a       INTEGER NOT NULL,
-    team_b       INTEGER NOT NULL,
-    score_a      REAL,
-    score_b      REAL,
-    PRIMARY KEY (league_key, week, team_a)
 );
 """
 
@@ -89,13 +75,7 @@ def init_schema(conn: sqlite3.Connection):
 
     if "eligible_slots" not in columns:
         conn.execute("ALTER TABLE players ADD COLUMN eligible_slots TEXT")
-    
-    columns = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(ownership)").fetchall()
-    }
-    if "reserved" not in columns:
-        conn.execute("ALTER TABLE ownership ADD COLUMN reserved TEXT")
+
     conn.commit()
 
 
@@ -177,68 +157,25 @@ def upsert_projection(conn, league_key, player_id, week, projected_points):
     )
 
 
-def upsert_ownership(conn, league_key, player_id, week, team_id, reserved=None):
+def upsert_ownership(conn, league_key, player_id, week, team_id):
     conn.execute(
         "INSERT INTO ownership "
-        "(league_key, player_id, week, team_id, reserved) "
-        "VALUES (?, ?, ?, ?, ?) "
+        "(league_key, player_id, week, team_id) "
+        "VALUES (?, ?, ?, ?) "
         "ON CONFLICT(league_key, player_id, week) DO UPDATE SET "
-        "team_id=excluded.team_id, reserved=excluded.reserved",
-        (league_key, player_id, week, team_id, reserved),
+        "team_id=excluded.team_id",
+        (league_key, player_id, week, team_id),
     )
 
 
-def replace_schedule(conn, league_key, matchups):
-    """
-    Replace a league's entire stored regular-season schedule.
-
-    matchups: iterable of (week, team_a, team_b, score_a, score_b) where
-    the two scores are the actual final scores for a week that's already
-    been played and None otherwise. Deleting first (rather than upserting)
-    keeps re-ingestion idempotent even if the platform reshuffled a
-    matchup.
-    """
-    conn.execute("DELETE FROM schedule WHERE league_key = ?", (league_key,))
-    conn.executemany(
-        "INSERT INTO schedule (league_key, week, team_a, team_b, score_a, score_b) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        [(league_key, w, a, b, sa, sb) for (w, a, b, sa, sb) in matchups],
-    )
-    conn.commit()
-
-
-def move_player(conn, league_key: str, player_id: str, new_team_id, from_week: int) -> int:
-    """
-    Manually reassign a player to a different team (or to free agency,
-    if new_team_id is None) starting at from_week and for every later
-    week already sitting in the ownership table.
-
-    This is a local-only override for the "move a player" UI control in
-    app.py's Rosters tab - it doesn't talk to ESPN/Sleeper at all, it
-    just edits the ownership rows that simulator.py/waiver.py/trades.py
-    already read from. It intentionally updates every week >= from_week
-    (not just one), since the whole point is to change what the season
-    simulation assumes the roster looks like going forward - a single
-    week's ownership row wouldn't affect any of those season totals.
-
-    Clears any IR/Taxi `reserved` flag on the affected rows: a manual
-    move is by definition putting the player on an active roster spot
-    (or off the roster entirely, for free agency), not into a reserved
-    slot - there's no UI for reserving a player, only for moving one.
-
-    NOTE: this is overwritten the next time `ingest.py` runs, since
-    ingestion re-derives real ownership from the platform for every
-    ingested week. That's expected - this is a scratch/what-if edit,
-    not a substitute for actually making the move on ESPN/Sleeper.
-
-    Returns the number of ownership rows updated (0 usually means
-    from_week is later than every ingested week for this league, or
-    the player has no ownership rows in this league at all).
-    """
-    cur = conn.execute(
-        "UPDATE ownership SET team_id = ?, reserved = NULL "
-        "WHERE league_key = ? AND player_id = ? AND week >= ?",
-        (new_team_id, league_key, player_id, from_week),
-    )
-    conn.commit()
-    return cur.rowcount
+def get_player_ids_by_prefix(conn, prefix: str) -> list:
+    """Every player_id we've ever cached for one platform (e.g. 'yahoo_') -
+    used by ingest_yahoo_week to know the full universe of players to
+    write an ownership/projection row for each week, the same way
+    ingest_sleeper_week iterates every rostered player plus every
+    free agent Sleeper returned."""
+    rows = conn.execute(
+        "SELECT player_id FROM players WHERE player_id LIKE ?",
+        (prefix + "%",),
+    ).fetchall()
+    return [r[0] for r in rows]

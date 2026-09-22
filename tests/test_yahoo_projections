@@ -1,0 +1,58 @@
+"""
+Unit test for the Yahoo<->Sleeper player crosswalk in yahoo_projections.py -
+mocks both HTTP calls (Sleeper's player dictionary and its weekly
+projections endpoint) so this runs offline, same as the rest of the
+suite doesn't hit any real platform APIs.
+
+Run with:
+    python -m pytest tests/test_yahoo_projections.py -v
+"""
+
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import yahoo_projections
+
+
+FAKE_SLEEPER_PLAYERS = {
+    "1001": {"yahoo_id": "30123", "position": "RB"},
+    "1002": {"yahoo_id": "30456", "position": "WR"},
+    "1003": {"position": "TE"},  # no yahoo_id - should just be skipped, not crash
+}
+
+FAKE_SLEEPER_PROJECTIONS = [
+    {"player_id": "1001", "stats": {"pts_ppr": 15.4, "pts_std": 9.4}},
+    {"player_id": "1002", "stats": {"pts_ppr": 11.0, "pts_std": 8.0}},
+    # a projection entry for a sleeper player with no yahoo_id at all -
+    # should be silently ignored by the mapping, not crash it
+    {"player_id": "1003", "stats": {"pts_ppr": 5.0, "pts_std": 5.0}},
+]
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def test_get_projections_week_maps_yahoo_ids_via_sleeper(monkeypatch):
+    # reset the module-level cache so this test doesn't depend on
+    # ordering relative to other tests that might import the module
+    yahoo_projections._yahoo_to_sleeper_cache = None
+
+    with patch("yahoo_projections.requests.get", return_value=_FakeResponse(FAKE_SLEEPER_PLAYERS)), \
+         patch("yahoo_projections.sleeper_client.fetch_projections_week", return_value=FAKE_SLEEPER_PROJECTIONS):
+        result = yahoo_projections.get_projections_week(season=2026, week=3, scoring_settings={"rec": 1})
+
+    assert result == {"30123": 15.4, "30456": 11.0}
+    # the sleeper player with no yahoo_id must not leak into the result
+    assert "5.0" not in result.values()
+    assert len(result) == 2
