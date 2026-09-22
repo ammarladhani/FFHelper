@@ -69,7 +69,7 @@ def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
 # candidate_prefilter note below) - default to 1-for-1 only, same as
 # the README documents. Pass combo_sizes=(1, 2) explicitly, with a
 # smaller candidate_prefilter, if you want the wider (slower) search.
-DEFAULT_COMBO_SIZES = (1,)
+DEFAULT_COMBO_SIZES = (1, 2)
 
 
 def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_week: int,

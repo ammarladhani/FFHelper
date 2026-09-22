@@ -3,7 +3,7 @@
 
 # Personal fantasy data - regenerate locally with `python ingest.py`
 fantasy.db
-*.db
+*.db-*
 
 # Python
 __pycache__/
