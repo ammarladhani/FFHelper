@@ -21,6 +21,7 @@ import repo
 import simulator
 import waiver
 import trades
+import win_probability
 
 
 def _decay(args):
@@ -249,6 +250,69 @@ def cmd_records(args, conn):
               f"({result['champion']['manager_name']})")
 
 
+def cmd_odds(args, conn):
+    try:
+        ps = league_info.playoff_settings(args.league)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+
+    as_of = args.as_of_week or league_info.current_week(last_week=ps["end_week"])
+    week = args.week or as_of
+
+    schedule = repo.get_schedule(conn, args.league)
+    sim = simulator.simulate_all_teams(conn, args.league, 1, ps["end_week"], as_of_week=as_of)
+    weekly_means = {tid: r["weekly"] for tid, r in sim.items()}
+    names = {tid: r["team_name"] for tid, r in sim.items()}
+
+    matchups = win_probability.week_matchup_probabilities(schedule, weekly_means, week, args.std_fraction)
+    print(f"\nWin probabilities for week {week} (rosters as of week {as_of}, "
+          f"score stdev={args.std_fraction:.0%} of projection):\n")
+    if not matchups:
+        print("  No unplayed matchups found for this week (already played, past the regular "
+              "season, or no schedule stored).")
+    for m in matchups:
+        print(f"  {names[m['team_a']]:<25} {m['win_prob_a'] * 100:5.1f}%   vs   "
+              f"{m['win_prob_b'] * 100:5.1f}%  {names[m['team_b']]:<25}")
+
+    try:
+        result = win_probability.project_league_probabilities(
+            conn, args.league, ps["end_week"], ps["regular_season_weeks"], ps["playoff_teams"],
+            ps["playoff_weeks"], as_of_week=as_of, std_fraction=args.std_fraction, n_sims=args.n_sims,
+        )
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+
+    print(f"\nSeason-long odds (simulated {args.n_sims:,} times):\n")
+    print(f"  {'Team':<25}{'Playoffs%':>11}{'Champ%':>9}{'Avg record':>13}{'Avg seed':>10}")
+    for r in result["teams"]:
+        avg_record = f"{r['avg_wins']:.1f}-{r['avg_losses']:.1f}"
+        print(f"  {r['team_name']:<25}{r['playoff_pct']:>10.1f}%{r['champion_pct']:>8.1f}%"
+              f"{avg_record:>13}{r['avg_seed']:>10.2f}")
+
+
+def cmd_calibrate(args, conn):
+    try:
+        result = win_probability.calibrate_std_fraction(conn, args.league, min_games=args.min_games)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+
+    if result["bias"] > 0.02:
+        bias_note = "actual scores have been running ABOVE projections"
+    elif result["bias"] < -0.02:
+        bias_note = "actual scores have been running BELOW projections"
+    else:
+        bias_note = "no meaningful systematic bias so far"
+
+    print(f"\nCalibrating uncertainty for '{args.league}' from {result['n_games']} played team-weeks:\n")
+    print(f"  Suggested std_fraction: {result['std_fraction']:.3f}  ({result['std_fraction'] * 100:.1f}%)")
+    print(f"  Bias: {result['bias'] * 100:+.1f}%  ({bias_note})")
+    print(f"\n  Use it with: python cli.py odds --league {args.league} --std-fraction {result['std_fraction']:.2f}")
+    print("\n  Note: this compares actual scores to what the OPTIMAL lineup would have projected, "
+          "not necessarily what was actually started, so it can run a bit high if managers don't "
+          "always start their best lineup. It's also only as reliable as the number of played "
+          "weeks behind it - treat it skeptically early in the season.")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Fantasy football optimizer")
     parser.add_argument("--db", default=config.DB_PATH)
@@ -336,6 +400,28 @@ def build_parser():
     p.add_argument("--as-of-week", type=int, dest="as_of_week", default=None,
                    help="project forward from this week's rosters (default: the current week)")
     p.set_defaults(func=cmd_records)
+
+    p = sub.add_parser("odds", help="matchup win probabilities and season-long championship odds (Monte Carlo)")
+    p.add_argument("--league", required=True, help="league key from config.py")
+    p.add_argument("--as-of-week", type=int, dest="as_of_week", default=None,
+                   help="project forward from this week's rosters (default: the current week)")
+    p.add_argument("--week", type=int, default=None,
+                   help="which week's matchup odds to show (default: the current/as-of week)")
+    p.add_argument("--std-fraction", type=float, dest="std_fraction",
+                   default=config.DEFAULT_SCORE_STD_FRACTION,
+                   help=f"weekly score stdev as a fraction of the projection "
+                        f"(default {config.DEFAULT_SCORE_STD_FRACTION:g} - see win_probability.py "
+                        f"for what this assumes)")
+    p.add_argument("--n-sims", type=int, dest="n_sims", default=config.DEFAULT_N_SIMS,
+                   help=f"number of Monte Carlo season replays (default {config.DEFAULT_N_SIMS})")
+    p.set_defaults(func=cmd_odds)
+
+    p = sub.add_parser("calibrate", help="estimate a data-driven --std-fraction from this league's own "
+                                          "actual-vs-projected history")
+    p.add_argument("--league", required=True, help="league key from config.py")
+    p.add_argument("--min-games", type=int, dest="min_games", default=8,
+                   help="minimum played team-weeks required before trusting the estimate (default 8)")
+    p.set_defaults(func=cmd_calibrate)
 
     return parser
 

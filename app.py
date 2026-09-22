@@ -20,6 +20,7 @@ import simulator
 import waiver
 import trades
 import weighting
+import win_probability
 
 st.set_page_config(page_title="Fantasy Optimizer", page_icon="🏈", layout="wide")
 
@@ -128,8 +129,9 @@ scope_key = f"{league}::{my_team_id}::{start_week}-{end_week}::decay={decay}"
 
 # ------------------------------------------------------------- standings
 
-tab_standings, tab_records, tab_waiver, tab_trade_finder, tab_trade_eval, tab_rosters = st.tabs(
-    ["📊 Standings", "🏆 Projected Records", "🔄 Waiver Wire", "🤝 Trade Finder", "⚖️ Evaluate Trade", "📋 Rosters"]
+tab_standings, tab_records, tab_odds, tab_waiver, tab_trade_finder, tab_trade_eval, tab_rosters = st.tabs(
+    ["📊 Standings", "🏆 Projected Records", "🎲 Win Probabilities", "🔄 Waiver Wire",
+     "🤝 Trade Finder", "⚖️ Evaluate Trade", "📋 Rosters"]
 )
 
 with tab_standings:
@@ -239,6 +241,134 @@ with tab_records:
                     )
                 else:
                     st.write("No games found for this team in the stored schedule.")
+
+# ------------------------------------------------------ win probabilities
+
+with tab_odds:
+    st.subheader("Win probabilities (Monte Carlo)")
+    st.caption(
+        "Projected Records assumes every projection is exactly right and always gives the game "
+        "to the higher-projected team - a team a slight favorite in five straight games ends up "
+        "shown as a lock. This tab instead treats each team's weekly score as uncertain (Normal "
+        "around its projection) and replays the season thousands of times to get an actual "
+        "percentage chance for each matchup and for the championship. There's no real "
+        "week-to-week scoring variance ingested to calibrate this against, so the spread below is "
+        "a configurable assumption, not a precise forecast - raise it for a boom/bust league, "
+        "lower it for one that plays close to projections."
+    )
+    try:
+        playoff_cfg_odds = league_info.playoff_settings(league)
+    except ValueError as e:
+        st.info(str(e))
+    else:
+        reg_weeks_odds = playoff_cfg_odds["regular_season_weeks"]
+
+        def _apply_calibration():
+            try:
+                calib = win_probability.calibrate_std_fraction(conn, league)
+            except ValueError as e:
+                st.session_state["calibration_error"] = str(e)
+                st.session_state.pop("calibration_result", None)
+            else:
+                st.session_state["odds_std_pct"] = int(round(calib["std_fraction"] * 1000))
+                st.session_state["calibration_result"] = calib
+                st.session_state.pop("calibration_error", None)
+
+        cal_c1, cal_c2 = st.columns([1, 3])
+        cal_c1.button("📐 Estimate from actual results", key="calibrate_btn", on_click=_apply_calibration,
+                      help="Compares each team's actual score in already-played weeks against what "
+                           "their roster was projected to score, and sets the slider below to the "
+                           "spread actually observed in this league so far.")
+        if st.session_state.get("calibration_error"):
+            cal_c2.caption(f"⚠️ {st.session_state['calibration_error']}")
+        elif st.session_state.get("calibration_result"):
+            c = st.session_state["calibration_result"]
+            cal_c2.caption(
+                f"From {c['n_games']} played team-weeks: {c['std_fraction'] * 100:.1f}% "
+                f"(bias {c['bias'] * 100:+.1f}%). Compares actual scores to the OPTIMAL lineup's "
+                f"projection, not necessarily what was actually started, so this can run a bit high."
+            )
+
+        oc1, oc2, oc3 = st.columns(3)
+        std_pct = oc1.slider(
+            "Weekly score uncertainty (± % of projection)", 50, 400, int(config.DEFAULT_SCORE_STD_FRACTION * 1000),
+            key="odds_std_pct",
+            help="Roughly how far a team's actual score typically lands from its projection. "
+                 "Higher = more upsets, less confident favorites.",
+        )
+        std_fraction = std_pct / 1000
+        n_sims = oc2.select_slider(
+            "Simulations", options=[500, 1000, 2000, 5000, 10000, 20000, 50000, 100000], value=config.DEFAULT_N_SIMS,
+            key="odds_n_sims",
+        )
+        odds_week = oc3.number_input(
+            "Matchup odds for week", min_value=1, max_value=reg_weeks_odds,
+            value=min(max(start_week, 1), reg_weeks_odds), key="odds_week",
+        )
+
+        odds_scope_key = f"{league}::{start_week}::{std_fraction}::{n_sims}::{odds_week}"
+        if st.button("Calculate odds", key="odds_btn"):
+            with st.spinner(f"Simulating the season {n_sims:,} times..."):
+                schedule = repo.get_schedule(conn, league)
+                sim_odds = simulator.simulate_all_teams(
+                    conn, league, 1, playoff_cfg_odds["end_week"], as_of_week=start_week,
+                )
+                weekly_means = {tid: r["weekly"] for tid, r in sim_odds.items()}
+                names_odds = {tid: r["team_name"] for tid, r in sim_odds.items()}
+                matchups = win_probability.week_matchup_probabilities(
+                    schedule, weekly_means, odds_week, std_fraction,
+                )
+                try:
+                    season_odds = win_probability.project_league_probabilities(
+                        conn, league, playoff_cfg_odds["end_week"], reg_weeks_odds,
+                        playoff_cfg_odds["playoff_teams"], playoff_cfg_odds["playoff_weeks"],
+                        as_of_week=start_week, std_fraction=std_fraction, n_sims=n_sims,
+                    )
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    st.session_state["odds_result"] = {
+                        "scope": odds_scope_key, "matchups": matchups,
+                        "names": names_odds, "season": season_odds,
+                    }
+
+        cached_odds = st.session_state.get("odds_result")
+        odds_data = cached_odds if cached_odds and cached_odds["scope"] == odds_scope_key else None
+        if odds_data is None:
+            st.info("Click 'Calculate odds' to run.")
+        else:
+            names_odds = odds_data["names"]
+
+            st.write(f"**Week {odds_week} matchup odds**")
+            if not odds_data["matchups"]:
+                st.caption("No unplayed matchups found for this week (already played, past the "
+                           "regular season, or no schedule stored).")
+            for m in odds_data["matchups"]:
+                c1, c2, c3 = st.columns([4, 2, 4])
+                c1.write(f"{names_odds[m['team_a']]}  ({m['mean_a']:.1f} proj)")
+                c2.markdown(f"<div style='text-align:center'><b>{m['win_prob_a']*100:.0f}% – "
+                            f"{m['win_prob_b']*100:.0f}%</b></div>", unsafe_allow_html=True)
+                c3.write(f"({m['mean_b']:.1f} proj)  {names_odds[m['team_b']]}")
+
+            st.divider()
+            st.write("**Season-long odds**")
+            st.dataframe(
+                pd.DataFrame([
+                    {"Team": r["team_name"], "Manager": r["manager_name"],
+                     "Make Playoffs": f"{r['playoff_pct']:.1f}%",
+                     "Win Championship": f"{r['champion_pct']:.1f}%",
+                     "Avg Record": f"{r['avg_wins']:.1f}-{r['avg_losses']:.1f}",
+                     "Avg Seed": r["avg_seed"]}
+                    for r in odds_data["season"]["teams"]
+                ]),
+                use_container_width=True, hide_index=True,
+            )
+            st.bar_chart(
+                pd.DataFrame([
+                    {"Team": r["team_name"], "Championship %": r["champion_pct"]}
+                    for r in odds_data["season"]["teams"]
+                ]).set_index("Team")
+            )
 
 # ---------------------------------------------------------------- waiver
 

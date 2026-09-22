@@ -16,6 +16,7 @@ Run with:
 
 import sqlite3
 import sys
+import random
 from datetime import date
 from pathlib import Path
 
@@ -34,6 +35,7 @@ import simulator
 import waiver
 import trades
 import weighting
+import win_probability
 
 LEAGUE = "test_league"
 
@@ -465,3 +467,148 @@ def test_ingest_schedule_manual_override_and_skip(conn, monkeypatch, capsys):
     monkeypatch.setattr(config, "LEAGUES", [unset])
     ingest.ingest_schedule(conn, unset, LEAGUE, "sleeper", 2026)
     assert "skipping schedule ingest" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Win probabilities (Monte Carlo)
+# ---------------------------------------------------------------------------
+
+def test_matchup_win_probability():
+    # equal means -> a coin flip, regardless of spread
+    assert win_probability.matchup_win_probability(100.0, 100.0, 20.0, 20.0) == pytest.approx(0.5)
+    # a is favored -> probability above 0.5
+    assert win_probability.matchup_win_probability(110.0, 100.0, 20.0, 20.0) > 0.5
+    # b is favored -> probability below 0.5, and the two sides sum to 1
+    p_b_favored = win_probability.matchup_win_probability(90.0, 100.0, 20.0, 20.0)
+    assert p_b_favored < 0.5
+    # zero spread (both std 0) is just "did A's mean beat B's mean"
+    assert win_probability.matchup_win_probability(101.0, 100.0, 0.0, 0.0) == 1.0
+    assert win_probability.matchup_win_probability(100.0, 101.0, 0.0, 0.0) == 0.0
+    assert win_probability.matchup_win_probability(100.0, 100.0, 0.0, 0.0) == 0.5
+    # a bigger lead is a higher win probability, same spread
+    small_lead = win_probability.matchup_win_probability(105.0, 100.0, 20.0, 20.0)
+    big_lead = win_probability.matchup_win_probability(130.0, 100.0, 20.0, 20.0)
+    assert 0.5 < small_lead < big_lead < 1.0
+
+
+def test_week_matchup_probabilities_skips_played_weeks():
+    schedule = [
+        (1, 1, 2, 80.0, 95.0),   # already played - not a probability question
+        (2, 1, 2, None, None),   # not yet played
+    ]
+    weekly_means = {1: {2: 100.0}, 2: {2: 90.0}}
+    result = win_probability.week_matchup_probabilities(schedule, weekly_means, week=2, std_fraction=0.2)
+    assert len(result) == 1
+    m = result[0]
+    assert (m["team_a"], m["team_b"], m["mean_a"], m["mean_b"]) == (1, 2, 100.0, 90.0)
+    assert m["win_prob_a"] + m["win_prob_b"] == pytest.approx(1.0)
+    assert m["win_prob_a"] > 0.5   # team 1 is projected higher
+
+    # week 1 is already played -> nothing returned for it
+    assert win_probability.week_matchup_probabilities(schedule, weekly_means, week=1) == []
+
+
+def test_project_league_probabilities_requires_a_schedule(conn):
+    with pytest.raises(ValueError, match="No regular-season schedule"):
+        win_probability.project_league_probabilities(
+            conn, LEAGUE, end_week=2, regular_season_weeks=1,
+            playoff_teams=2, playoff_weeks=1,
+        )
+
+
+def test_project_league_probabilities_matches_deterministic_at_zero_variance(conn):
+    """With std_fraction=0 every trial samples the exact projected mean, so
+    the Monte Carlo result should agree exactly with the deterministic
+    bracket in season_records.project_league (100%/0% champion, same
+    record)."""
+    db.replace_schedule(conn, LEAGUE, [(1, 1, 2, None, None)])
+    deterministic = records.project_league(
+        conn, LEAGUE, end_week=2, regular_season_weeks=1, playoff_teams=2, playoff_weeks=1,
+        as_of_week=1,
+    )
+    mc = win_probability.project_league_probabilities(
+        conn, LEAGUE, end_week=2, regular_season_weeks=1, playoff_teams=2, playoff_weeks=1,
+        as_of_week=1, std_fraction=0.0, n_sims=25, seed=1,
+    )
+    champ_id = deterministic["champion"]["team_id"]
+    by_id = {r["team_id"]: r for r in mc["teams"]}
+    assert by_id[champ_id]["champion_pct"] == 100.0
+    other_id = next(tid for tid in by_id if tid != champ_id)
+    assert by_id[other_id]["champion_pct"] == 0.0
+    assert by_id[champ_id]["playoff_pct"] == 100.0
+    assert by_id[other_id]["playoff_pct"] == 100.0  # both teams make a 2-team, 2-slot playoff
+
+    det_by_id = {t["team_id"]: t for t in deterministic["teams"]}
+    for tid, row in by_id.items():
+        assert row["avg_wins"] == pytest.approx(det_by_id[tid]["wins"])
+        assert row["avg_losses"] == pytest.approx(det_by_id[tid]["losses"])
+
+
+def test_project_league_probabilities_sanity_bounds(conn):
+    """With real variance, results should stay well-formed: every
+    percentage in [0, 100], playoff slots sum to the configured count, wins
+    and losses add up to the number of games actually scheduled."""
+    db.replace_schedule(conn, LEAGUE, [(1, 1, 2, None, None), (2, 1, 2, None, None)])
+    result = win_probability.project_league_probabilities(
+        conn, LEAGUE, end_week=3, regular_season_weeks=2, playoff_teams=2, playoff_weeks=1,
+        as_of_week=1, std_fraction=0.25, n_sims=300, seed=7,
+    )
+    assert result["n_sims"] == 300
+    total_playoff_pct = sum(r["playoff_pct"] for r in result["teams"])
+    total_champion_pct = sum(r["champion_pct"] for r in result["teams"])
+    assert total_playoff_pct == pytest.approx(200.0, abs=1.0)   # 2 playoff slots, 2 teams total -> both always in
+    assert total_champion_pct == pytest.approx(100.0, abs=1.0)
+    for r in result["teams"]:
+        assert 0.0 <= r["playoff_pct"] <= 100.0
+        assert 0.0 <= r["champion_pct"] <= 100.0
+        assert r["avg_wins"] + r["avg_losses"] == pytest.approx(2.0, abs=0.01)  # 2 games each, no ties expected
+
+
+
+def test_calibrate_std_fraction_requires_min_games(conn):
+    db.replace_schedule(conn, LEAGUE, [(1, 1, 2, 80.0, 90.0)])  # only 2 played team-weeks
+    with pytest.raises(ValueError, match="need at least"):
+        win_probability.calibrate_std_fraction(conn, LEAGUE, min_games=8)
+
+
+@pytest.fixture
+def conn_calibration():
+    """A 2-team, 12-week league where each week's actual score is the
+    projection times a KNOWN Gaussian noise factor, so calibrate_std_fraction
+    can be checked against a ground-truth std_fraction."""
+    connection = sqlite3.connect(":memory:")
+    db.init_schema(connection)
+    db.upsert_league(connection, LEAGUE, 1, 2026)
+    db.upsert_team(connection, LEAGUE, 1, "Team A", "Alice")
+    db.upsert_team(connection, LEAGUE, 2, "Team B", "Bob")
+    db.upsert_setting(connection, LEAGUE, 0, "QB", 1)
+
+    n_weeks = 12
+    db.upsert_player(connection, "p_a", "QB A", "QB", None, ["QB", "BE"])
+    db.upsert_player(connection, "p_b", "QB B", "QB", None, ["QB", "BE"])
+    for week in range(1, n_weeks + 1):
+        db.upsert_projection(connection, LEAGUE, "p_a", week, 100.0)
+        db.upsert_projection(connection, LEAGUE, "p_b", week, 90.0)
+        db.upsert_ownership(connection, LEAGUE, "p_a", week, 1)
+        db.upsert_ownership(connection, LEAGUE, "p_b", week, 2)
+
+    true_std = 0.15
+    rng = random.Random(99)
+    sched = [
+        (week, 1, 2, round(100.0 * (1 + rng.gauss(0, true_std)), 2),
+                     round(90.0 * (1 + rng.gauss(0, true_std)), 2))
+        for week in range(1, n_weeks + 1)
+    ]
+    db.replace_schedule(connection, LEAGUE, sched)
+    connection.commit()
+    yield connection, true_std
+    connection.close()
+
+
+def test_calibrate_std_fraction_recovers_known_noise(conn_calibration):
+    connection, true_std = conn_calibration
+    result = win_probability.calibrate_std_fraction(connection, LEAGUE, min_games=8)
+    assert result["n_games"] == 24  # 12 weeks x 2 teams
+    assert result["std_fraction"] == pytest.approx(true_std, abs=0.06)
+    assert abs(result["bias"]) < 0.1  # fixture has no built-in over/under-projection bias
+    assert len(result["residuals"]) == 24
