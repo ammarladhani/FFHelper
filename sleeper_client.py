@@ -30,6 +30,16 @@ def fetch_users(league_id: str) -> list:
     return resp.json()
 
 
+def fetch_matchups(league_id: str, week: int) -> list:
+    """One week's matchup entries: [{roster_id, matchup_id, points, ...}].
+    The two rosters in a head-to-head share a matchup_id; a bye week has
+    matchup_id null. `points` is the actual score once the week is played
+    (0 before that)."""
+    resp = requests.get(f"{BASE}/league/{league_id}/matchups/{week}", timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def fetch_projections_week(season: int, week: int) -> list:
     url = f"https://api.sleeper.app/projections/nfl/{season}/{week}?season_type=regular"
     resp = requests.get(url, timeout=60)

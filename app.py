@@ -13,10 +13,13 @@ import streamlit as st
 import config
 import db
 import ingest
+import league_info
+import season_records as records
 import repo
 import simulator
 import waiver
 import trades
+import weighting
 
 st.set_page_config(page_title="Fantasy Optimizer", page_icon="🏈", layout="wide")
 
@@ -25,7 +28,7 @@ FREE_AGENCY_LABEL = "🆓 Free Agency"
 # Session/result caches that go stale the moment ownership changes -
 # either from the manual "move a player" control or from re-running
 # ingest.py - so both of those clear this list before rerunning.
-STALE_ON_ROSTER_CHANGE = ("waiver_picks", "waiver_plan", "trade_proposals")
+STALE_ON_ROSTER_CHANGE = ("waiver_picks", "waiver_plan", "trade_proposals", "records_result")
 
 
 @st.cache_resource
@@ -62,12 +65,44 @@ default_index = label_list.index(default_label) if default_label in label_list e
 my_team_label = st.sidebar.selectbox("Your team", label_list, index=default_index)
 my_team_id = team_labels[my_team_label]
 
-start_week, end_week = st.sidebar.slider("Week range", 1, 18, (1, 18))
-st.sidebar.caption(f"League key: `{league}` · Team ID: `{my_team_id}`")
+# The slider runs 1 .. THIS league's last week (ESPN and Sleeper can differ),
+# and starts at the current week (rolls over every Sunday, see config.WEEK_1_START).
+# Keyed per league so switching leagues gets its own range instead of carrying
+# over a value that might be out of bounds for the other league's season length.
+league_end = league_info.league_end_week(league)
+current_week = league_info.current_week(last_week=league_end)
+start_week, end_week = st.sidebar.slider(
+    "Week range", 1, league_end, (current_week, league_end),
+    key=f"week_range_{league}_{league_end}",
+    help=f"Defaults to the current week ({current_week}) through the end of this league's "
+         f"season (week {league_end}).",
+)
+st.sidebar.caption(f"League key: `{league}` · Team ID: `{my_team_id}` · Current week: {current_week}")
+
+st.sidebar.divider()
+use_weighting = st.sidebar.toggle(
+    "Weight nearer weeks more heavily", value=False, key="use_weighting",
+    help="Rank and sort by recency-weighted projected points instead of a plain sum: each "
+         "week further out counts for less, since far-off projections are less reliable and "
+         "near-term points are the ones you can act on.",
+)
+decay = None
+if use_weighting:
+    decay = st.sidebar.slider(
+        "Weekly decay", 0.50, 0.99, config.DEFAULT_DECAY, 0.01, key="decay",
+        help="Each week counts this fraction of the week before it. 0.90 = a point next week "
+             "is worth 0.9 of a point this week; lower = more short-sighted.",
+    )
+    _w = weighting.week_weights(start_week, end_week, decay)
+    st.sidebar.caption(
+        f"Week {start_week} counts 1.00 → week {min(start_week + 4, end_week)} counts "
+        f"{_w[min(start_week + 4, end_week)]:.2f} → week {end_week} counts {_w[end_week]:.2f}"
+    )
+GAIN_LABEL = "Weighted gain" if decay is not None else "Gain"
 
 st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh data (run ingest.py)",
-                      help="Re-pulls every league's teams, settings, rosters, and weekly "
+                      help="Re-pulls every league's teams, settings, rosters, schedule, and weekly "
                            "projections from ESPN/Sleeper. Takes a few minutes per league. "
                            "This overwrites any manual moves made in the Rosters tab, since "
                            "it re-derives real ownership from the platform."):
@@ -83,36 +118,134 @@ if st.sidebar.button("🔄 Refresh data (run ingest.py)",
             st.rerun()
 
 # Results are cached in session_state so they survive re-runs from other
-# widgets, but they need to be keyed by (league, team, week range) -
+# widgets, but they need to be keyed by (league, team, week range, weighting) -
 # otherwise switching teams in the sidebar kept showing the PREVIOUS
 # team's waiver picks / trade proposals under the new team's label until
 # you clicked the button again, which is a good way to make someone drop
-# the wrong player.
-scope_key = f"{league}::{my_team_id}::{start_week}-{end_week}"
+# the wrong player. Weighting is part of the key for the same reason: a
+# list ranked by plain points must not linger under the "weighted" toggle.
+scope_key = f"{league}::{my_team_id}::{start_week}-{end_week}::decay={decay}"
 
 # ------------------------------------------------------------- standings
 
-tab_standings, tab_waiver, tab_trade_finder, tab_trade_eval, tab_rosters = st.tabs(
-    ["📊 Standings", "🔄 Waiver Wire", "🤝 Trade Finder", "⚖️ Evaluate Trade", "📋 Rosters"]
+tab_standings, tab_records, tab_waiver, tab_trade_finder, tab_trade_eval, tab_rosters = st.tabs(
+    ["📊 Standings", "🏆 Projected Records", "🔄 Waiver Wire", "🤝 Trade Finder", "⚖️ Evaluate Trade", "📋 Rosters"]
 )
 
 with tab_standings:
     st.subheader(f"Projected totals, weeks {start_week}-{end_week}")
     if st.button("Run simulation", key="sim_btn"):
         with st.spinner("Simulating every team's optimal lineup, week by week..."):
-            results = simulator.simulate_all_teams(conn, league, start_week, end_week)
+            results = simulator.simulate_all_teams(conn, league, start_week, end_week, decay=decay)
+        # `total` is the weighted total when weighting is on, the plain sum otherwise,
+        # so this sort follows the sidebar toggle.
         rows = sorted(results.items(), key=lambda kv: kv[1]["total"], reverse=True)
-        df = pd.DataFrame([
-            {"Team": r["team_name"], "Manager": r["manager_name"], "Projected Total": round(r["total"], 1)}
-            for _, r in rows
-        ])
+        table = []
+        for _, r in rows:
+            entry = {"Team": r["team_name"], "Manager": r["manager_name"],
+                     "Projected Total": round(r["raw_total"], 1)}
+            if decay is not None:
+                entry["Weighted Total"] = round(r["weighted_total"], 1)
+            table.append(entry)
+        df = pd.DataFrame(table)
+        if decay is not None:
+            st.caption(f"Sorted by weighted total (decay {decay:g}/week).")
         st.dataframe(df, use_container_width=True, hide_index=True)
-        st.bar_chart(df.set_index("Team")["Projected Total"])
+        st.bar_chart(df.set_index("Team")["Weighted Total" if decay is not None else "Projected Total"])
+
+# ------------------------------------------------------- projected records
+
+with tab_records:
+    st.subheader("Projected records & league champion")
+    try:
+        playoff_cfg = league_info.playoff_settings(league)
+    except ValueError as e:
+        st.info(str(e))
+    else:
+        reg_weeks = playoff_cfg["regular_season_weeks"]
+        st.caption(
+            f"{playoff_cfg['playoff_teams']} of {len(teams)} teams make the playoffs · regular season = "
+            f"weeks 1-{reg_weeks} · playoffs = weeks {reg_weeks + 1}-{playoff_cfg['end_week']}. Weeks "
+            f"already played use actual scores; every other week goes to whichever team's projected "
+            f"optimal lineup scores more (rosters as of week {start_week}). This view always covers the "
+            f"whole season, regardless of the week-range slider's end or the weighting toggle."
+        )
+
+        records_scope_key = f"{league}::{start_week}"
+        if st.button("Project records & champion", key="records_btn"):
+            with st.spinner("Simulating every team's lineup for the whole season..."):
+                try:
+                    result = records.project_league(
+                        conn, league,
+                        end_week=playoff_cfg["end_week"], regular_season_weeks=reg_weeks,
+                        playoff_teams=playoff_cfg["playoff_teams"],
+                        playoff_weeks=playoff_cfg["playoff_weeks"], as_of_week=start_week,
+                    )
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    st.session_state["records_result"] = {"scope": records_scope_key, "data": result}
+
+        cached_records = st.session_state.get("records_result")
+        proj = cached_records["data"] if cached_records and cached_records["scope"] == records_scope_key else None
+        if proj is None:
+            st.info("Click 'Project records & champion' to run.")
+        else:
+            if proj["champion"]:
+                st.success(f"🏆 Projected champion: **{proj['champion']['team_name']}** "
+                           f"({proj['champion']['manager_name']})")
+
+            st.dataframe(
+                pd.DataFrame([
+                    {"Seed": r["seed"], "Team": r["team_name"], "Manager": r["manager_name"],
+                     "Record": records.record_str(r),
+                     "Points For": round(r["points_for"], 1), "Points Against": round(r["points_against"], 1),
+                     "Playoffs": "✅" if r["made_playoffs"] else "",
+                     "Champion": "🏆" if r["is_champion"] else ""}
+                    for r in proj["teams"]
+                ]),
+                use_container_width=True, hide_index=True,
+            )
+
+            names = {r["team_id"]: r["team_name"] for r in proj["teams"]}
+            seed_of = {r["team_id"]: r["seed"] for r in proj["teams"]}
+
+            st.write("**Projected playoffs**")
+            for n, rnd in enumerate(proj["playoffs"]["rounds"], start=1):
+                st.write(f"Round {n} · week {rnd['week']}")
+                for tid in rnd["byes"]:
+                    st.write(f"- #{seed_of[tid]} {names[tid]} — bye")
+                for m in rnd["matchups"]:
+                    st.write(
+                        f"- #{m['seed_a']} {names[m['team_a']]} ({m['score_a']:.1f}) vs "
+                        f"#{m['seed_b']} {names[m['team_b']]} ({m['score_b']:.1f}) → "
+                        f"**{names[m['winner']]}**"
+                    )
+
+            with st.expander("Game-by-game: why does a team have this record?"):
+                game_team = st.selectbox("Team", [r["team_name"] for r in proj["teams"]], key="records_game_team")
+                team_row = next(r for r in proj["teams"] if r["team_name"] == game_team)
+                if team_row["games"]:
+                    st.dataframe(
+                        pd.DataFrame([
+                            {"Week": g["week"], "Opponent": names[g["opponent"]],
+                             "Points For": round(g["points_for"], 1),
+                             "Points Against": round(g["points_against"], 1),
+                             "Result": g["result"],
+                             "Source": "Actual" if g["actual"] else "Projected"}
+                            for g in sorted(team_row["games"], key=lambda g: g["week"])
+                        ]),
+                        use_container_width=True, hide_index=True,
+                    )
+                else:
+                    st.write("No games found for this team in the stored schedule.")
 
 # ---------------------------------------------------------------- waiver
 
 with tab_waiver:
     st.subheader(f"Best pickups for {my_team_label}")
+    if decay is not None:
+        st.caption(f"Ranked by weighted gain (decay {decay:g}/week); raw projected points shown underneath.")
     col1, col2, col3 = st.columns(3)
     top_n = col1.slider("How many to show", 5, 50, 15, key="waiver_topn")
     by_position = col2.checkbox("Search per-position", key="waiver_by_position",
@@ -131,6 +264,7 @@ with tab_waiver:
                 top_n=top_n, by_position=by_position,
                 fa_per_position=fa_limit if by_position else waiver.DEFAULT_FA_PER_POSITION,
                 fa_prefilter=fa_limit if not by_position else waiver.DEFAULT_FA_PREFILTER,
+                decay=decay,
             )
         st.session_state["waiver_picks"] = {"scope": scope_key, "data": picks}
 
@@ -145,12 +279,14 @@ with tab_waiver:
         c1, c2, c3 = st.columns([3, 3, 1])
         c1.write(f"**Add:** {add_name}")
         c2.write(f"**Drop:** {drop_name}")
-        c3.metric("Gain", f"+{p['projected_gain']:.1f}")
+        c3.metric(GAIN_LABEL, f"+{p['projected_gain']:.1f}")
+        if decay is not None:
+            c3.caption(f"{p['raw_gain']:+.1f} raw pts")
         with st.expander("Why does this help? (week by week)"):
             if add and drop:
                 explanation = waiver.explain_pickup(
                     conn, league, my_team_id, add["player_id"], drop["player_id"],
-                    start_week, end_week,
+                    start_week, end_week, decay=decay,
                 )
                 weeks = sorted(explanation["weekly_before"].keys())
                 chart_df = pd.DataFrame({
@@ -160,6 +296,9 @@ with tab_waiver:
                 }).set_index("Week")
                 st.line_chart(chart_df)
                 st.dataframe(chart_df.reset_index(), hide_index=True, use_container_width=True)
+                if decay is not None:
+                    st.caption(f"Raw: {explanation['raw_delta']:+.1f} pts · "
+                               f"Weighted: {explanation['delta']:+.1f} (decay {decay:g}/week)")
         st.divider()
 
     st.divider()
@@ -180,25 +319,32 @@ with tab_waiver:
                 by_position=by_position,
                 fa_per_position=fa_limit if by_position else waiver.DEFAULT_FA_PER_POSITION,
                 fa_prefilter=fa_limit if not by_position else waiver.DEFAULT_FA_PREFILTER,
+                decay=decay,
             )
         st.session_state["waiver_plan"] = {"scope": plan_scope_key, "data": plan}
 
     cached_plan = st.session_state.get("waiver_plan")
     plan = cached_plan["data"] if cached_plan and cached_plan["scope"] == plan_scope_key else None
+    total_word = "weighted total" if decay is not None else "total"
     if not plan:
         st.info("Click 'Plan moves' to search.")
     elif not plan["moves"]:
-        st.write(f"Starting total: **{plan['starting_total']:.1f}** - no move found that improves it.")
+        st.write(f"Starting {total_word}: **{plan['starting_total']:.1f}** - no move found that improves it.")
     else:
-        st.write(f"Starting total: **{plan['starting_total']:.1f}**  →  "
-                 f"Final total: **{plan['final_total']:.1f}**  "
+        st.write(f"Starting {total_word}: **{plan['starting_total']:.1f}**  →  "
+                 f"Final {total_word}: **{plan['final_total']:.1f}**  "
                  f"(total gain **+{plan['total_gain']:.1f}**)")
+        if decay is not None:
+            st.caption(f"In raw projected points: {plan['starting_raw_total']:.1f} → "
+                       f"{plan['final_raw_total']:.1f} ({plan['total_raw_gain']:+.1f})")
         for m in plan["moves"]:
             c1, c2, c3, c4 = st.columns([1, 3, 3, 2])
             c1.write(f"**Step {m['step']}**")
             c2.write(f"Add: {m['add']['name']}")
             c3.write(f"Drop: {m['drop']['name']}")
-            c4.metric("Gain", f"+{m['gain']:.1f}")
+            c4.metric(GAIN_LABEL, f"+{m['gain']:.1f}")
+            if decay is not None:
+                c4.caption(f"{m['raw_gain']:+.1f} raw pts")
 
         totals_df = pd.DataFrame({
             "Step": [0] + [m["step"] for m in plan["moves"]],
@@ -210,6 +356,9 @@ with tab_waiver:
 
 with tab_trade_finder:
     st.subheader(f"Win-win trades for {my_team_label}")
+    if decay is not None:
+        st.caption(f"'Win-win' and the sort order use weighted totals (decay {decay:g}/week); "
+                   "raw projected-point changes shown in brackets.")
 
     partner_labels = {"Any team": None}
     partner_labels.update({t["team_name"]: t["team_id"] for t in teams if t["team_id"] != my_team_id})
@@ -235,7 +384,7 @@ with tab_trade_finder:
         all_proposals = trades.suggest_trades(
             conn, league, my_team_id, start_week, end_week,
             candidate_prefilter=prefilter, partner_team_id=partner_team_id,
-            progress_callback=_update_progress,
+            progress_callback=_update_progress, decay=decay,
         )
 
         progress_bar.empty()
@@ -252,9 +401,12 @@ with tab_trade_finder:
         for p in proposals:
             give_str = ", ".join(x["name"] for x in p["give"])
             get_str = ", ".join(x["name"] for x in p["get"])
+            raw_note = ""
+            if decay is not None:
+                raw_note = f" [raw: you {p['my_raw_delta']:+.1f}, {p['partner_raw_delta']:+.1f}]"
             st.write(
                 f"**Give:** {give_str} &nbsp;→&nbsp; **Get:** {get_str}  "
-                f"&nbsp;&nbsp;(you: +{p['my_delta']:.1f}, {p['partner_team_name']}: +{p['partner_delta']:.1f})"
+                f"&nbsp;&nbsp;(you: +{p['my_delta']:.1f}, {p['partner_team_name']}: +{p['partner_delta']:.1f}){raw_note}"
             )
 
         give_counts, get_counts = {}, {}
@@ -311,13 +463,18 @@ with tab_trade_eval:
                 get_ids = [other_names[n] for n in get_selection]
                 result = trades.explain_trade(
                     conn, league, my_team_id, give_ids, other_team_id, get_ids,
-                    start_week, end_week,
+                    start_week, end_week, decay=decay,
                 )
                 a, b = result["team_a"], result["team_b"]
 
+                # Headline numbers are always plain projected points; the
+                # weighted view (when on) is added underneath.
                 m1, m2 = st.columns(2)
-                m1.metric(my_team_label, f"{a['total_after']:.1f}", f"{a['delta']:+.1f}")
-                m2.metric(other_team_label, f"{b['total_after']:.1f}", f"{b['delta']:+.1f}")
+                m1.metric(my_team_label, f"{a['raw_total_after']:.1f}", f"{a['raw_delta']:+.1f}")
+                m2.metric(other_team_label, f"{b['raw_total_after']:.1f}", f"{b['raw_delta']:+.1f}")
+                if decay is not None:
+                    st.caption(f"Weighted (decay {decay:g}/week): {my_team_label} {a['delta']:+.1f}, "
+                               f"{other_team_label} {b['delta']:+.1f}")
 
                 for label, side in [(my_team_label, a), (other_team_label, b)]:
                     st.write(f"**{label}**")
@@ -335,17 +492,28 @@ with tab_rosters:
     st.subheader("Browse a roster")
     roster_team_label = st.selectbox("Team", label_list, key="roster_team_select")
     roster_team_id = team_labels[roster_team_label]
-    roster_week = st.number_input("As of week", min_value=1, max_value=18, value=start_week, key="roster_week")
+    roster_week = st.number_input("As of week", min_value=1, max_value=league_end,
+                                   value=start_week, key="roster_week")
 
     player_ids = repo.get_roster_player_ids(conn, league, roster_team_id, roster_week)
     players = repo.get_roster_with_projection(conn, league, player_ids, roster_week)
     if not players:
         st.info("No players found for this team/week.")
     else:
-        df = pd.DataFrame([
-            {"Name": p["name"], "Position": p["position"], "Projected": p["projected"]}
-            for p in players
-        ]).sort_values("Projected", ascending=False, na_position="last")
+        ros_totals = repo.get_projection_totals(
+            conn, league, [p["player_id"] for p in players], roster_week, end_week, decay,
+        )
+        rows = []
+        for p in players:
+            row = {"Name": p["name"], "Position": p["position"], "Projected": p["projected"],
+                   "Rest of season": round(ros_totals[p["player_id"]]["raw"], 1)}
+            if decay is not None:
+                row["Rest of season (weighted)"] = round(ros_totals[p["player_id"]]["weighted"], 1)
+            rows.append(row)
+        sort_col = "Rest of season (weighted)" if decay is not None else "Projected"
+        df = pd.DataFrame(rows).sort_values(sort_col, ascending=False, na_position="last")
+        st.caption(f"'Projected' is week {roster_week} only; 'Rest of season' covers weeks "
+                   f"{roster_week}-{end_week}. Sorted by {sort_col.lower()}.")
         st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.divider()
@@ -362,7 +530,7 @@ with tab_rosters:
     move_label_list = list(move_team_labels.keys())
 
     move_effective_week = st.number_input(
-        "Effective from week", min_value=1, max_value=18, value=int(start_week), key="move_effective_week",
+        "Effective from week", min_value=1, max_value=league_end, value=int(start_week), key="move_effective_week",
         help="Applies to this week and every later week already in the database - i.e. it "
              "changes the roster for the rest of the season's simulations, not just one "
              "week's snapshot.",

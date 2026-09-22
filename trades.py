@@ -10,11 +10,19 @@ Trade engine with two entry points:
 
 The search is capped to a prefiltered subset of each roster to keep
 the combinatorics sane - see `candidate_prefilter`.
+
+Every entry point takes an optional `decay` (None = off). When given,
+the candidate prefilter, the win-win test, and the sort order all use
+recency-weighted totals (see weighting.py) - near-term weeks count for
+more. Returned `delta` numbers are in that same weighted metric; the
+`raw_*` twins are the plain, unweighted point changes.
 """
 
 from itertools import combinations
 from math import comb
 import math
+from typing import Optional
+
 import repo
 from simulator import simulate_roster
 
@@ -27,7 +35,7 @@ def _reject_reserved(conn, league_key, team_id, player_ids, as_of_week):
 
 def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
                     team_b_id: int, team_b_gives: list, start_week: int, end_week: int,
-                    as_of_week: int = None) -> dict:
+                    as_of_week: int = None, decay: Optional[float] = None) -> dict:
     as_of_week = as_of_week or start_week
     _reject_reserved(conn, league_key, team_a_id, team_a_gives, as_of_week)
     _reject_reserved(conn, league_key, team_b_id, team_b_gives, as_of_week)
@@ -36,20 +44,24 @@ def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
     a_ids = repo.get_roster_player_ids(conn, league_key, team_a_id, as_of_week)
     b_ids = repo.get_roster_player_ids(conn, league_key, team_b_id, as_of_week)
 
-    baseline_a = simulate_roster(conn, league_key, a_ids, slot_counts, start_week, end_week)
-    baseline_b = simulate_roster(conn, league_key, b_ids, slot_counts, start_week, end_week)
+    baseline_a = simulate_roster(conn, league_key, a_ids, slot_counts, start_week, end_week, decay=decay)
+    baseline_b = simulate_roster(conn, league_key, b_ids, slot_counts, start_week, end_week, decay=decay)
 
     new_a_ids = [pid for pid in a_ids if pid not in team_a_gives] + team_b_gives
     new_b_ids = [pid for pid in b_ids if pid not in team_b_gives] + team_a_gives
 
-    new_a = simulate_roster(conn, league_key, new_a_ids, slot_counts, start_week, end_week)
-    new_b = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week)
+    new_a = simulate_roster(conn, league_key, new_a_ids, slot_counts, start_week, end_week, decay=decay)
+    new_b = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week, decay=decay)
 
     return {
         "team_a": {"team_id": team_a_id, "before": baseline_a["total"], "after": new_a["total"],
-                   "delta": round(new_a["total"] - baseline_a["total"], 2)},
+                   "delta": round(new_a["total"] - baseline_a["total"], 2),
+                   "raw_before": baseline_a["raw_total"], "raw_after": new_a["raw_total"],
+                   "raw_delta": round(new_a["raw_total"] - baseline_a["raw_total"], 2)},
         "team_b": {"team_id": team_b_id, "before": baseline_b["total"], "after": new_b["total"],
-                   "delta": round(new_b["total"] - baseline_b["total"], 2)},
+                   "delta": round(new_b["total"] - baseline_b["total"], 2),
+                   "raw_before": baseline_b["raw_total"], "raw_after": new_b["raw_total"],
+                   "raw_delta": round(new_b["raw_total"] - baseline_b["raw_total"], 2)},
     }
 
 
@@ -57,13 +69,13 @@ def evaluate_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
 # candidate_prefilter note below) - default to 1-for-1 only, same as
 # the README documents. Pass combo_sizes=(1, 2) explicitly, with a
 # smaller candidate_prefilter, if you want the wider (slower) search.
-DEFAULT_COMBO_SIZES = (1,2)
+DEFAULT_COMBO_SIZES = (1,)
 
 
 def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_week: int,
                     as_of_week: int = None, candidate_prefilter: int = 12,
                     combo_sizes=DEFAULT_COMBO_SIZES, partner_team_id: int = None,
-                    progress_callback=None) -> list:
+                    progress_callback=None, decay: Optional[float] = None) -> list:
     """
     Search win-win 1-for-1 (and optionally larger, via combo_sizes)
     trades between my_team_id and every other team in the league - or,
@@ -73,9 +85,9 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
     the caller decides how much of that to display vs. summarize.
 
     candidate_prefilter limits each side's roster to its top N players
-    by naive rest-of-season projected sum before generating trade
-    combinations, since full combinatorics over a ~15-man roster on
-    both sides explodes quickly.
+    by naive rest-of-season projection sum (recency-weighted if `decay`
+    is given) before generating trade combinations, since full
+    combinatorics over a ~15-man roster on both sides explodes quickly.
 
     Performance notes:
     - each team's "no trade happened" baseline total is computed ONCE
@@ -104,12 +116,14 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
     my_reserved = repo.get_reserved_player_ids(conn, league_key, my_team_id, as_of_week)
     my_tradeable_ids = [pid for pid in my_ids_full if pid not in my_reserved]
     my_candidates = _top_players_by_rest_of_season(
-        conn, league_key, my_tradeable_ids, start_week, end_week, candidate_prefilter,
+        conn, league_key, my_tradeable_ids, start_week, end_week, candidate_prefilter, decay,
     )
-    my_baseline = simulate_roster(
+    my_baseline_sim = simulate_roster(
         conn, league_key, my_ids_full, slot_counts, start_week, end_week,
-        player_info_cache, projection_cache,
-    )["total"]
+        player_info_cache, projection_cache, decay=decay,
+    )
+    my_baseline = my_baseline_sim["total"]
+    my_baseline_raw = my_baseline_sim["raw_total"]
 
     # First pass: figure out each opposing team's candidate pool up front
     # (cheap - just SQL + sorting, no simulation) so we can both (a) reuse
@@ -126,7 +140,7 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
         other_reserved = repo.get_reserved_player_ids(conn, league_key, other_id, as_of_week)
         other_tradeable_ids = [pid for pid in other_ids_full if pid not in other_reserved]
         other_candidates = _top_players_by_rest_of_season(
-            conn, league_key, other_tradeable_ids, start_week, end_week, candidate_prefilter,
+            conn, league_key, other_tradeable_ids, start_week, end_week, candidate_prefilter, decay,
         )
         team_data[other_id] = (other_ids_full, other_candidates)
 
@@ -151,10 +165,12 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
             continue
 
         other_ids_full, other_candidates = team_data[other_id]
-        other_baseline = simulate_roster(
+        other_baseline_sim = simulate_roster(
             conn, league_key, other_ids_full, slot_counts, start_week, end_week,
-            player_info_cache, projection_cache,
-        )["total"]
+            player_info_cache, projection_cache, decay=decay,
+        )
+        other_baseline = other_baseline_sim["total"]
+        other_baseline_raw = other_baseline_sim["raw_total"]
 
         for size in combo_sizes:
             for my_combo in combinations(my_candidates, size):
@@ -165,20 +181,20 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
                     _report()
 
                     trial_a_ids = new_a_ids + list(other_combo)
-                    new_a_total = simulate_roster(
+                    new_a_sim = simulate_roster(
                         conn, league_key, trial_a_ids, slot_counts, start_week, end_week,
-                        player_info_cache, projection_cache,
-                    )["total"]
-                    my_delta = round(new_a_total - my_baseline, 2)
+                        player_info_cache, projection_cache, decay=decay,
+                    )
+                    my_delta = round(new_a_sim["total"] - my_baseline, 2)
                     if my_delta <= 0:
                         continue  # doesn't even help me - skip the pricier partner-side check
 
                     new_b_ids = [pid for pid in other_ids_full if pid not in other_combo] + list(my_combo)
-                    new_b_total = simulate_roster(
+                    new_b_sim = simulate_roster(
                         conn, league_key, new_b_ids, slot_counts, start_week, end_week,
-                        player_info_cache, projection_cache,
-                    )["total"]
-                    partner_delta = round(new_b_total - other_baseline, 2)
+                        player_info_cache, projection_cache, decay=decay,
+                    )
+                    partner_delta = round(new_b_sim["total"] - other_baseline, 2)
                     if partner_delta <= 0:
                         continue
 
@@ -189,6 +205,8 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
                         "partner_team_name": team["team_name"],
                         "my_delta": my_delta,
                         "partner_delta": partner_delta,
+                        "my_raw_delta": round(new_a_sim["raw_total"] - my_baseline_raw, 2),
+                        "partner_raw_delta": round(new_b_sim["raw_total"] - other_baseline_raw, 2),
                     })
 
     _report(force=True)  # make sure the caller sees 100% at the end
@@ -197,35 +215,31 @@ def suggest_trades(conn, league_key: str, my_team_id: int, start_week: int, end_
     return proposals
 
 
-def _top_players_by_rest_of_season(conn, league_key, player_ids, start_week, end_week, limit):
+def _top_players_by_rest_of_season(conn, league_key, player_ids, start_week, end_week, limit,
+                                    decay: Optional[float] = None):
+    """Rank player_ids by rest-of-season projection - recency-weighted
+    if `decay` is given, plain sum otherwise - and keep the top `limit`."""
     if not player_ids:
         return []
-    placeholders = ",".join("?" for _ in player_ids)
-    rows = conn.execute(
-        f"""
-        SELECT player_id, SUM(COALESCE(projected_points, 0)) AS total
-        FROM projections
-        WHERE league_key = ? AND week BETWEEN ? AND ? AND player_id IN ({placeholders})
-        GROUP BY player_id
-        ORDER BY total DESC
-        """,
-        [league_key, start_week, end_week] + player_ids,
-    ).fetchall()
-    ranked = [r[0] for r in rows]
-    # Any player with literally no projection rows at all in this range
-    # (shouldn't normally happen - ingestion writes a row every week even
-    # when the value is None) won't appear in the GROUP BY result; tack
-    # them on at the bottom rather than silently dropping them.
-    missing = [pid for pid in player_ids if pid not in ranked]
-    return (ranked + missing)[:limit]
+    totals = repo.get_projection_totals(conn, league_key, player_ids, start_week, end_week, decay)
+    # Every requested id is in `totals` (0.0 if it had no projection rows
+    # at all), so nobody gets silently dropped; sorted() is stable, so ties
+    # keep the roster's original order.
+    ranked = sorted(player_ids, key=lambda pid: totals[pid]["weighted"], reverse=True)
+    return ranked[:limit]
 
 
 def explain_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
                    team_b_id: int, team_b_gives: list, start_week: int, end_week: int,
-                   as_of_week: int = None) -> dict:
+                   as_of_week: int = None, decay: Optional[float] = None) -> dict:
     """
     Week-by-week comparison of both teams' projected totals with vs
     without a specific trade, for the "why does this help" view.
+
+    weekly_before/weekly_after are raw per-week points. total_*/delta are
+    recency-weighted when `decay` is set (plain sums otherwise);
+    raw_total_*/raw_delta are always the plain sums; `weights` is the
+    {week: weight} used.
     """
     as_of_week = as_of_week or start_week
     slot_counts = repo.get_slot_counts(conn, league_key)
@@ -233,26 +247,27 @@ def explain_trade(conn, league_key: str, team_a_id: int, team_a_gives: list,
     a_ids = repo.get_roster_player_ids(conn, league_key, team_a_id, as_of_week)
     b_ids = repo.get_roster_player_ids(conn, league_key, team_b_id, as_of_week)
 
-    before_a = simulate_roster(conn, league_key, a_ids, slot_counts, start_week, end_week)
-    before_b = simulate_roster(conn, league_key, b_ids, slot_counts, start_week, end_week)
+    before_a = simulate_roster(conn, league_key, a_ids, slot_counts, start_week, end_week, decay=decay)
+    before_b = simulate_roster(conn, league_key, b_ids, slot_counts, start_week, end_week, decay=decay)
 
     new_a_ids = [pid for pid in a_ids if pid not in team_a_gives] + team_b_gives
     new_b_ids = [pid for pid in b_ids if pid not in team_b_gives] + team_a_gives
 
-    after_a = simulate_roster(conn, league_key, new_a_ids, slot_counts, start_week, end_week)
-    after_b = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week)
+    after_a = simulate_roster(conn, league_key, new_a_ids, slot_counts, start_week, end_week, decay=decay)
+    after_b = simulate_roster(conn, league_key, new_b_ids, slot_counts, start_week, end_week, decay=decay)
+
+    def _side(team_id, before, after):
+        return {
+            "team_id": team_id,
+            "weekly_before": before["weekly"], "weekly_after": after["weekly"],
+            "weights": before["weights"],
+            "total_before": before["total"], "total_after": after["total"],
+            "delta": after["total"] - before["total"],
+            "raw_total_before": before["raw_total"], "raw_total_after": after["raw_total"],
+            "raw_delta": after["raw_total"] - before["raw_total"],
+        }
 
     return {
-        "team_a": {
-            "team_id": team_a_id,
-            "weekly_before": before_a["weekly"], "weekly_after": after_a["weekly"],
-            "total_before": before_a["total"], "total_after": after_a["total"],
-            "delta": after_a["total"] - before_a["total"],
-        },
-        "team_b": {
-            "team_id": team_b_id,
-            "weekly_before": before_b["weekly"], "weekly_after": after_b["weekly"],
-            "total_before": before_b["total"], "total_after": after_b["total"],
-            "delta": after_b["total"] - before_b["total"],
-        },
+        "team_a": _side(team_a_id, before_a, after_a),
+        "team_b": _side(team_b_id, before_b, after_b),
     }

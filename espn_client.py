@@ -137,3 +137,57 @@ def fetch_roster_slots(league_cfg, season: int, week: int) -> dict:
             if player_id is not None:
                 slots[player_id] = entry.get("lineupSlotId")
     return slots
+
+
+def fetch_schedule(league_cfg, season: int) -> list:
+    """
+    Raw `schedule` entries (every head-to-head matchup, regular season
+    and playoffs) from ESPN's matchup views. Use parse_schedule() to turn
+    them into (week, team_a, team_b, score_a, score_b) tuples.
+    """
+    base_url = _base_url(league_cfg, season)
+    cookies = _cookies(league_cfg)
+    params = {"view": ["mMatchup", "mMatchupScore"]}
+
+    resp = requests.get(base_url, params=params, cookies=cookies, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    if "messages" in data:
+        raise RuntimeError(
+            f"ESPN returned an error fetching the schedule (often means the SWID/"
+            f"espn_s2 cookies have expired): {data['messages']}"
+        )
+    return data.get("schedule", [])
+
+
+def parse_schedule(entries: list, regular_season_weeks: int) -> list:
+    """
+    ESPN schedule entries -> [(week, home_team_id, away_team_id,
+    home_score, away_score)] for regular-season head-to-heads only.
+
+    Scores are only kept once ESPN has decided the matchup (`winner` is
+    HOME/AWAY/TIE - it's UNDECIDED until then), so unplayed and
+    in-progress weeks come back with None scores and get projected
+    instead. Byes (no away side) and playoff-bracket entries
+    (`playoffTierType` other than NONE) are skipped.
+    """
+    matchups = []
+    for entry in entries:
+        if entry.get("playoffTierType", "NONE") != "NONE":
+            continue
+        week = entry.get("matchupPeriodId")
+        if week is None or week > regular_season_weeks:
+            continue
+        home, away = entry.get("home"), entry.get("away")
+        if not home or not away:
+            continue  # bye week
+        home_id, away_id = home.get("teamId"), away.get("teamId")
+        if home_id is None or away_id is None:
+            continue
+        decided = entry.get("winner") in ("HOME", "AWAY", "TIE")
+        matchups.append((
+            week, home_id, away_id,
+            home.get("totalPoints") if decided else None,
+            away.get("totalPoints") if decided else None,
+        ))
+    return matchups

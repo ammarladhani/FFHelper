@@ -1,8 +1,11 @@
 """
-Pull every league's teams, roster settings, and weekly player
-projections + ownership into the local SQLite database. Supports
-multiple platforms (ESPN, Sleeper) writing into the same schema -
+Pull every league's teams, roster settings, regular-season schedule, and
+weekly player projections + ownership into the local SQLite database.
+Supports multiple platforms (ESPN, Sleeper) writing into the same schema -
 each league_cfg's "platform" key decides which ingestion path runs.
+
+Each league is ingested for weeks START_WEEK .. that league's own
+"end_week" (see config.py), not one global last week.
 
 Player IDs are prefixed by platform ("espn_<id>", "sleeper_<id>")
 before being stored, since ESPN and Sleeper use completely separate,
@@ -19,6 +22,7 @@ from collections import Counter
 import config
 import db
 import espn_client
+import league_info
 import sleeper_client
 
 
@@ -266,6 +270,92 @@ def ingest_sleeper_week(conn, league_cfg, league_key, season, week):
     conn.commit()
 
 
+# ------------------------------------------------------------ Schedule
+
+def matchups_from_config(schedule_cfg: dict, regular_season_weeks: int) -> list:
+    """config's manual {week: [(team_a, team_b), ...]} -> schedule tuples.
+    No scores: a hand-entered schedule is projected week by week."""
+    return [
+        (week, a, b, None, None)
+        for week, pairs in sorted(schedule_cfg.items())
+        if week <= regular_season_weeks
+        for a, b in pairs
+    ]
+
+
+def sleeper_matchups(league_id, regular_season_weeks: int, played_through: int) -> list:
+    """
+    Regular-season matchups from Sleeper's per-week matchup endpoint.
+    Two rosters sharing a matchup_id are opponents; a null matchup_id is
+    a bye. Actual scores are recorded only for weeks <= played_through
+    (Sleeper reports 0 points for weeks that haven't happened yet, which
+    must not be mistaken for a real 0-0 result).
+    """
+    matchups = []
+    for week in range(1, regular_season_weeks + 1):
+        by_matchup = {}
+        for entry in sleeper_client.fetch_matchups(league_id, week):
+            matchup_id = entry.get("matchup_id")
+            if matchup_id is None:
+                continue
+            by_matchup.setdefault(matchup_id, []).append(entry)
+
+        completed = week <= played_through
+        for pair in by_matchup.values():
+            if len(pair) != 2:
+                continue
+            a, b = pair
+            matchups.append((
+                week, a["roster_id"], b["roster_id"],
+                a.get("points") if completed else None,
+                b.get("points") if completed else None,
+            ))
+    return matchups
+
+
+def ingest_schedule(conn, league_cfg, league_key, platform, season):
+    """
+    Store this league's regular-season schedule (and actual scores for
+    weeks already played). Needs playoff_weeks in config to know where
+    the regular season ends; skips with a message if that's not filled
+    in. A failure here is reported but never aborts the rest of ingest -
+    the schedule only feeds the projected-records view.
+    """
+    try:
+        settings = league_info.playoff_settings(league_key)
+    except ValueError as e:
+        print(f"[{league_key}] skipping schedule ingest: {e}")
+        return
+
+    regular_season_weeks = settings["regular_season_weeks"]
+    try:
+        if league_cfg.get("schedule"):
+            source = "config"
+            matchups = matchups_from_config(league_cfg["schedule"], regular_season_weeks)
+        elif platform == "espn":
+            source = "espn"
+            entries = espn_client.fetch_schedule(league_cfg, season)
+            matchups = espn_client.parse_schedule(entries, regular_season_weeks)
+        else:
+            source = "sleeper"
+            played_through = league_info.current_week(last_week=settings["end_week"]) - 1
+            matchups = sleeper_matchups(league_cfg["league_id"], regular_season_weeks, played_through)
+    except Exception as e:  # noqa: BLE001 - optional feature, keep ingesting other leagues
+        print(f"[{league_key}] WARNING: schedule ingest failed, projected records will be "
+              f"unavailable until it's fixed: {e!r}")
+        return
+
+    if not matchups:
+        print(f"[{league_key}] WARNING: no regular-season matchups found ({source}); "
+              "keeping any previously stored schedule.")
+        return
+
+    db.replace_schedule(conn, league_key, matchups)
+    played = sum(1 for m in matchups if m[3] is not None)
+    print(f"[{league_key}] schedule ({source}): {len(matchups)} matchups over "
+          f"{regular_season_weeks} regular-season weeks, {played} already played")
+
+
 # --------------------------------------------------------------- main
 
 def main():
@@ -275,15 +365,18 @@ def main():
     for league_cfg in config.LEAGUES:
         league_key = league_cfg["name"]
         platform = league_cfg.get("platform", "espn")
+        end_week = league_info.league_end_week(league_key)
 
         if platform == "espn":
             config.require_espn_credentials()
             ingest_espn_league_settings(conn, league_cfg, league_key, config.SEASON)
-            for week in range(config.START_WEEK, config.END_WEEK + 1):
+            ingest_schedule(conn, league_cfg, league_key, platform, config.SEASON)
+            for week in range(config.START_WEEK, end_week + 1):
                 ingest_espn_week(conn, league_cfg, league_key, config.SEASON, week)
         elif platform == "sleeper":
             ingest_sleeper_league_settings(conn, league_cfg, league_key, config.SEASON)
-            for week in range(config.START_WEEK, config.END_WEEK + 1):
+            ingest_schedule(conn, league_cfg, league_key, platform, config.SEASON)
+            for week in range(config.START_WEEK, end_week + 1):
                 ingest_sleeper_week(conn, league_cfg, league_key, config.SEASON, week)
         else:
             print(f"[{league_key}] unknown platform '{platform}', skipping")

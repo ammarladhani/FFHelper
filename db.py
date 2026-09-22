@@ -52,6 +52,19 @@ CREATE TABLE IF NOT EXISTS ownership (
     reserved     TEXT,  -- 'IR' / 'TAXI' / NULL (normal active roster spot)
     PRIMARY KEY (league_key, player_id, week)
 );
+
+-- Regular-season head-to-head matchups. One row per matchup (byes have no
+-- row). score_a/score_b are ACTUAL final scores for weeks that have already
+-- been played, NULL for weeks still to come (those get projected instead).
+CREATE TABLE IF NOT EXISTS schedule (
+    league_key   TEXT NOT NULL,
+    week         INTEGER NOT NULL,
+    team_a       INTEGER NOT NULL,
+    team_b       INTEGER NOT NULL,
+    score_a      REAL,
+    score_b      REAL,
+    PRIMARY KEY (league_key, week, team_a)
+);
 """
 
 
@@ -173,6 +186,25 @@ def upsert_ownership(conn, league_key, player_id, week, team_id, reserved=None):
         "team_id=excluded.team_id, reserved=excluded.reserved",
         (league_key, player_id, week, team_id, reserved),
     )
+
+
+def replace_schedule(conn, league_key, matchups):
+    """
+    Replace a league's entire stored regular-season schedule.
+
+    matchups: iterable of (week, team_a, team_b, score_a, score_b) where
+    the two scores are the actual final scores for a week that's already
+    been played and None otherwise. Deleting first (rather than upserting)
+    keeps re-ingestion idempotent even if the platform reshuffled a
+    matchup.
+    """
+    conn.execute("DELETE FROM schedule WHERE league_key = ?", (league_key,))
+    conn.executemany(
+        "INSERT INTO schedule (league_key, week, team_a, team_b, score_a, score_b) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [(league_key, w, a, b, sa, sb) for (w, a, b, sa, sb) in matchups],
+    )
+    conn.commit()
 
 
 def move_player(conn, league_key: str, player_id: str, new_team_id, from_week: int) -> int:

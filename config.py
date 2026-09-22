@@ -12,9 +12,27 @@ to commit / share.
 Sleeper entries need only a league_id - Sleeper's read API is public,
 no auth required. Find your league_id in the URL when viewing your
 league on sleeper.com, e.g. sleeper.com/leagues/<LEAGUE_ID>.
+
+Per-league season structure (all platforms):
+
+    end_week        Last week of the fantasy season, INCLUDING playoffs
+                    (ESPN league: 18, Sleeper league: 16). Ingestion, the
+                    week slider, and the CLI defaults all stop here.
+    playoff_teams   How many teams make the playoffs.
+    playoff_weeks   How many weeks the playoffs last. The regular season is
+                    therefore weeks 1 .. (end_week - playoff_weeks).
+    schedule        OPTIONAL manual override of the regular-season schedule,
+                    {week: [(team_id, team_id), ...]}. Normally leave this out
+                    - ingest.py pulls the real schedule (and actual scores for
+                    finished weeks) from ESPN/Sleeper automatically.
+
+playoff_teams / playoff_weeks are what the projected-records / champion
+view needs. They are left as None below on purpose: fill in YOUR leagues'
+real values rather than trusting a guess.
 """
 
 import os
+from datetime import date
 
 from dotenv import load_dotenv
 
@@ -30,19 +48,36 @@ LEAGUES = [
         "swid": os.environ.get("ESPN_SWID_MY_LEAGUE", ""),
         "espn_s2": os.environ.get("ESPN_S2_MY_LEAGUE", ""),
         "my_team_id": 11,
+        "end_week": 18,
+        "playoff_teams": 8,          # TODO: fill in (e.g. 6)
+        "playoff_weeks": 3,          # TODO: fill in (e.g. 3)
     },
     {
         "platform": "sleeper",
         "name": "sleeper_league",
         "league_id": "1322365155329216512",
         "my_team_id": 3,            # fill in with your roster_id after list-teams
+        "end_week": 16,
+        "playoff_teams": 6,          # TODO: fill in (e.g. 6)
+        "playoff_weeks": 3,          # TODO: fill in (e.g. 3)
     },
 ]
 
 START_WEEK = 1
+# Fallback last week for any league entry that doesn't set its own "end_week".
 END_WEEK = 18
 
 DB_PATH = "fantasy.db"
+
+# The SUNDAY on which "week 1" begins. The current week rolls over at
+# midnight every Sunday from here: 9/6 -> week 1, 9/13 -> week 2,
+# 9/20 -> week 3, ... Used to default the week slider to "this week".
+WEEK_1_START = date(2026, 9, 6)
+
+# Recency weighting: a week `n` weeks after the first week in the
+# selected range counts for DEFAULT_DECAY ** n of a week-0 point.
+# 0.9 -> each week further out is worth 90% of the one before it.
+DEFAULT_DECAY = 0.9
 
 
 def require_espn_credentials():
