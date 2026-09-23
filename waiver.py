@@ -24,11 +24,16 @@ are recency-weighted (see weighting.py) - near-term weeks count for more.
 `projected_gain` is always the metric the results are sorted by (weighted
 when `decay` is set); `raw_gain` is the same move's plain, unweighted
 point gain, so you can see what it's worth in real points too.
+
+Both entry points also take an optional `progress_callback(current, total,
+message=None)` - the web UI's jobs.Job.report is passed in here to drive
+a live progress bar; it's a no-op by default (None), so nothing here
+changes for existing CLI callers or the test suite, which never pass it.
 """
 
 import logging
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import repo
 from simulator import simulate_roster
@@ -63,7 +68,8 @@ def _get_fa_pool(conn, league_key: str, as_of_week: int, start_week: int, end_we
 
 def _search_pickups(conn, league_key: str, current_ids: list, droppable_ids: list, fa_ids: list,
                      slot_counts: dict, start_week: int, end_week: int, player_info_cache: dict,
-                     projection_cache: dict, top_n: int, decay: Optional[float] = None) -> tuple:
+                     projection_cache: dict, top_n: int, decay: Optional[float] = None,
+                     progress_callback: Optional[Callable] = None) -> tuple:
     """
     ...same docstring, plus:
     `droppable_ids` is the subset of current_ids allowed to be dropped
@@ -80,9 +86,12 @@ def _search_pickups(conn, league_key: str, current_ids: list, droppable_ids: lis
     baseline_raw = baseline_sim["raw_total"]
 
     results = []
-    for fa_id in fa_ids:
+    total_fa = len(fa_ids)
+    for i, fa_id in enumerate(fa_ids, start=1):
         fa_info = repo.get_player_info(conn, fa_id, cache=player_info_cache)
         if not fa_info:
+            if progress_callback:
+                progress_callback(i, total_fa)
             continue
 
         best_delta = None
@@ -108,6 +117,9 @@ def _search_pickups(conn, league_key: str, current_ids: list, droppable_ids: lis
             "raw_gain": round(best_raw_delta, 2) if best_raw_delta is not None else None,
         })
 
+        if progress_callback:
+            progress_callback(i, total_fa, f"Checked {fa_info['name']} ({i}/{total_fa})")
+
     results.sort(key=lambda r: (r["projected_gain"] or float("-inf")), reverse=True)
     return results[:top_n], baseline
 
@@ -116,7 +128,8 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
                   as_of_week: int = None, top_n: int = 10,
                   fa_prefilter: int = DEFAULT_FA_PREFILTER, by_position: bool = False,
                   fa_per_position: int = DEFAULT_FA_PER_POSITION,
-                  decay: Optional[float] = None) -> list:
+                  decay: Optional[float] = None,
+                  progress_callback: Optional[Callable] = None) -> list:
     total_start = time.perf_counter()
     as_of_week = as_of_week or start_week
     slot_counts = repo.get_slot_counts(conn, league_key)
@@ -133,6 +146,7 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
     results, _baseline = _search_pickups(
         conn, league_key, current_ids, droppable_ids, fa_ids, slot_counts, start_week, end_week,
         player_info_cache, projection_cache, top_n=top_n, decay=decay,
+        progress_callback=progress_callback,
     )
 
     logger.debug(
@@ -146,7 +160,8 @@ def best_pickups(conn, league_key: str, team_id: int, start_week: int, end_week:
 def plan_waiver_moves(conn, league_key: str, team_id: int, start_week: int, end_week: int,
                        as_of_week: int = None, fa_prefilter: int = DEFAULT_FA_PREFILTER,
                        by_position: bool = False, fa_per_position: int = DEFAULT_FA_PER_POSITION,
-                       max_moves: int = 50, decay: Optional[float] = None) -> dict:
+                       max_moves: int = 50, decay: Optional[float] = None,
+                       progress_callback: Optional[Callable] = None) -> dict:
     """
     Greedily chain add/drop moves: find the single best move, apply it,
     then search AGAIN against the resulting roster and a free agent
@@ -166,6 +181,10 @@ def plan_waiver_moves(conn, league_key: str, team_id: int, start_week: int, end_
     With `decay` set, "total"/"gain" figures are recency-weighted (the
     metric the plan is optimizing); the `*_raw_*` fields are the same
     numbers in plain, unweighted projected points.
+
+    `progress_callback(step, max_moves, message)`, if given, fires once
+    per completed step (max_moves is a safety cap, not the expected step
+    count, so treat this as "step N so far" rather than a true percentage).
     """
     as_of_week = as_of_week or start_week
     slot_counts = repo.get_slot_counts(conn, league_key)
@@ -185,6 +204,9 @@ def plan_waiver_moves(conn, league_key: str, team_id: int, start_week: int, end_
     starting_raw_total = starting_sim["raw_total"]
     running_total = starting_total
     running_raw_total = starting_raw_total
+
+    if progress_callback:
+        progress_callback(0, max_moves, "Checking your current roster for the first move...")
 
     moves = []
     for step in range(max_moves):
@@ -217,6 +239,13 @@ def plan_waiver_moves(conn, league_key: str, team_id: int, start_week: int, end_
             "running_total": running_total,
             "running_raw_total": running_raw_total,
         })
+
+        if progress_callback:
+            progress_callback(
+                step + 1, max_moves,
+                f"Step {step + 1}: add {best['add']['name']}, drop {best['drop']['name']} "
+                f"(+{best['projected_gain']:.1f})",
+            )
 
     return {
         "starting_total": round(starting_total, 2),

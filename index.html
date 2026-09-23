@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fantasy Football Optimizer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏈</text></svg>" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css" />
+<script src="/static/chart.min.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <!-- ------------------------------------------------------------ sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">FF</div>
+      <div class="brand-text">
+        <div class="name">Fantasy Optimizer</div>
+        <div class="tag">lineup &middot; waiver &middot; trade engine</div>
+      </div>
+    </div>
+
+    <div class="field-group">
+      <label class="field-label" for="league-select">League</label>
+      <select id="league-select"></select>
+    </div>
+
+    <div class="field-group">
+      <label class="field-label" for="team-select">Your team</label>
+      <select id="team-select"></select>
+    </div>
+
+    <div class="field-group">
+      <label class="field-label">Week range</label>
+      <div class="week-range">
+        <input type="number" id="start-week" min="1" />
+        <span>&rarr;</span>
+        <input type="number" id="end-week" min="1" />
+      </div>
+      <div class="field-hint" id="week-hint"></div>
+    </div>
+
+    <div class="field-group">
+      <div class="toggle-row">
+        <label class="field-label" for="weight-toggle" style="margin:0">Weight nearer weeks</label>
+        <label class="switch">
+          <input type="checkbox" id="weight-toggle" />
+          <span class="track"></span>
+          <span class="thumb"></span>
+        </label>
+      </div>
+      <div id="decay-row" style="display:none">
+        <input type="range" id="decay-slider" min="0.5" max="0.99" step="0.01" />
+        <div class="field-hint" id="decay-hint"></div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav"></nav>
+
+    <div class="sidebar-footer">
+      <button class="btn btn-block" id="refresh-btn">&#8635; Refresh data</button>
+      <div class="refresh-status ok" id="refresh-status"><span class="dot"></span><span id="refresh-status-text">Idle</span></div>
+      <div class="log-box" id="refresh-log" style="display:none"></div>
+    </div>
+  </aside>
+
+  <!-- -------------------------------------------------------------- main -->
+  <main class="main">
+    <div class="topbar">
+      <div class="topbar-title">
+        <h1 id="view-title">Standings</h1>
+        <span class="topbar-crumb" id="view-crumb"></span>
+      </div>
+      <div class="topbar-meta">
+        <span class="week-badge" id="current-week-badge"></span>
+        <span id="team-name-label"></span>
+      </div>
+    </div>
+
+    <section class="view" id="view-standings" data-view="standings">
+      <div class="view-header">
+        <div>
+          <h2>Projected standings</h2>
+          <div class="view-desc">Every team's optimal-lineup total across the selected week range, using the actual weekly-assignment lineup optimizer &mdash; not a greedy slot fill.</div>
+        </div>
+        <button class="btn btn-primary" id="standings-run">Run simulation</button>
+      </div>
+      <div id="standings-body"></div>
+    </section>
+
+    <section class="view hidden" id="view-records" data-view="records">
+      <div class="view-header">
+        <div>
+          <h2>Projected records &amp; playoffs</h2>
+          <div class="view-desc">Weeks already played use actual scores; every other week goes to whichever team's projected optimal lineup scores more.</div>
+        </div>
+        <button class="btn btn-primary" id="records-run">Project records &amp; champion</button>
+      </div>
+      <div id="records-body"></div>
+    </section>
+
+    <section class="view hidden" id="view-odds" data-view="odds">
+      <div class="view-header">
+        <div>
+          <h2>Win probabilities</h2>
+          <div class="view-desc">Monte Carlo replay of the season, treating each team's weekly score as uncertain rather than exact &mdash; gives an actual percentage instead of a deterministic bracket.</div>
+        </div>
+      </div>
+      <div id="odds-body"></div>
+    </section>
+
+    <section class="view hidden" id="view-waiver" data-view="waiver">
+      <div class="view-header">
+        <div>
+          <h2>Waiver wire</h2>
+          <div class="view-desc">Tests every free agent against every roster spot and ranks by season-total gain.</div>
+        </div>
+      </div>
+      <div id="waiver-body"></div>
+    </section>
+
+    <section class="view hidden" id="view-trades" data-view="trades">
+      <div class="view-header">
+        <div>
+          <h2>Trade finder</h2>
+          <div class="view-desc">Searches swaps with every other team, keeping only trades where BOTH sides' projected totals improve.</div>
+        </div>
+      </div>
+      <div id="trades-body"></div>
+    </section>
+
+    <section class="view hidden" id="view-evaluate" data-view="evaluate">
+      <div class="view-header">
+        <div>
+          <h2>Evaluate a trade</h2>
+          <div class="view-desc">Pick players on each side and see the exact before/after impact for both teams.</div>
+        </div>
+      </div>
+      <div id="evaluate-body"></div>
+    </section>
+
+    <section class="view hidden" id="view-rosters" data-view="rosters">
+      <div class="view-header">
+        <div>
+          <h2>Rosters</h2>
+          <div class="view-desc">Browse any team's roster, and manually move a player for a local what-if (doesn't touch ESPN/Sleeper).</div>
+        </div>
+      </div>
+      <div id="rosters-body"></div>
+    </section>
+
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
