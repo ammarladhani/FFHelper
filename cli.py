@@ -12,7 +12,7 @@ Examples:
 """
 
 import argparse
-
+import payouts
 import config
 import db
 import league_info
@@ -289,6 +289,27 @@ def cmd_odds(args, conn):
         print(f"  {r['team_name']:<25}{r['playoff_pct']:>10.1f}%{r['champion_pct']:>8.1f}%"
               f"{avg_record:>13}{r['avg_seed']:>10.2f}")
 
+def cmd_payouts(args, conn):
+    try:
+        ps = league_info.playoff_settings(args.league)
+        as_of = args.as_of_week or league_info.current_week(last_week=ps["end_week"])
+        result = payouts.expected_payouts(conn, args.league, as_of_week=as_of,
+                                          std_fraction=args.std_fraction, n_sims=args.n_sims)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+
+    s = result["summary"]
+    print(f"\nExpected payouts for {args.league} (buy-in ${s['buy_in']:g}, {s['n_sims']:,} sims, "
+          f"weekly-high weeks settled: {s['weekly_high_weeks_paid']}/{s['weekly_high_weeks_total']}):\n")
+    print(f"  {'Team':<25}{'Earned':>9}{'ROS EV':>9}{'Total EV':>10}{'Net EV':>9}{'1st%':>7}{'2nd%':>7}{'3rd%':>7}")
+    for r in result["teams"]:
+        print(f"  {r['team_name']:<25}{r['earned']:>9.2f}{r['expected_remaining']:>9.2f}"
+              f"{r['expected_total']:>10.2f}{r['expected_net']:>+9.2f}"
+              f"{r['first_pct']:>7.1f}{r['second_pct']:>7.1f}{r['third_pct']:>7.1f}")
+    if abs(s["total_prizes"] - s["total_buy_ins"]) > 0.005:
+        print(f"\n  Note: prizes total ${s['total_prizes']:g} but buy-ins total "
+              f"${s['total_buy_ins']:g} ({s['n_teams']} teams x ${s['buy_in']:g}) - check your payout config.")
+
 
 def cmd_calibrate(args, conn):
     try:
@@ -422,6 +443,14 @@ def build_parser():
     p.add_argument("--min-games", type=int, dest="min_games", default=8,
                    help="minimum played team-weeks required before trusting the estimate (default 8)")
     p.set_defaults(func=cmd_calibrate)
+
+    p = sub.add_parser("payouts", help="expected prize money: already earned + expected rest of season")
+    p.add_argument("--league", required=True, help="league key from config.py")
+    p.add_argument("--as-of-week", type=int, dest="as_of_week", default=None)
+    p.add_argument("--std-fraction", type=float, dest="std_fraction",
+                   default=config.DEFAULT_SCORE_STD_FRACTION)
+    p.add_argument("--n-sims", type=int, dest="n_sims", default=config.DEFAULT_N_SIMS)
+    p.set_defaults(func=cmd_payouts)
 
     return parser
 

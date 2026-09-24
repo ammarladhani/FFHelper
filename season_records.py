@@ -192,3 +192,34 @@ def record_str(row: dict) -> str:
     """'10-4' or '9-4-1' (ties shown only if there are any)."""
     base = f"{row['wins']}-{row['losses']}"
     return f"{base}-{row['ties']}" if row["ties"] else base
+
+def podium(playoffs: dict, weekly_scores: dict) -> dict:
+    """
+    {"first", "second", "third"} team_ids (None where the bracket has no such
+    finisher). 1st/2nd come from the final. 3rd is decided by a 3rd-place game
+    between the two semifinal losers in the final week (higher score wins, tie
+    goes to the better seed). With only one semifinal loser (3-team playoffs),
+    that team is 3rd.
+    """
+    rounds = playoffs["rounds"]
+    out = {"first": playoffs["champion"], "second": None, "third": None}
+    if not rounds:
+        return out
+
+    def loser(m):
+        return (m["team_b"], m["seed_b"]) if m["winner"] == m["team_a"] else (m["team_a"], m["seed_a"])
+
+    if rounds[-1]["matchups"]:
+        out["second"] = loser(rounds[-1]["matchups"][0])[0]
+
+    if len(rounds) >= 2:
+        losers = [loser(m) for m in rounds[-2]["matchups"]]
+        if len(losers) == 1:
+            out["third"] = losers[0][0]
+        elif len(losers) == 2:
+            week = rounds[-1]["week"]
+            (a, seed_a), (b, seed_b) = losers
+            score_a = weekly_scores[a].get(week, 0.0) or 0.0
+            score_b = weekly_scores[b].get(week, 0.0) or 0.0
+            out["third"] = a if (score_a, -seed_a) > (score_b, -seed_b) else b
+    return out

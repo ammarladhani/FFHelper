@@ -31,6 +31,7 @@ import config
 import db
 import ingest
 import jobs
+import payouts
 import league_info
 import repo
 import season_records as records
@@ -217,7 +218,7 @@ def projected_records(league: str, as_of_week: Optional[int] = None):
 def odds(league: str, week: int, as_of_week: Optional[int] = None,
          std_fraction: float = config.DEFAULT_SCORE_STD_FRACTION,
          n_sims: int = config.DEFAULT_N_SIMS):
-    _league_cfg(league)
+    cfg = _league_cfg(league)
     try:
         ps = league_info.playoff_settings(league)
     except ValueError as e:
@@ -242,7 +243,19 @@ def odds(league: str, week: int, as_of_week: Optional[int] = None,
     except ValueError as e:
         _bad_request(e)
 
-    return {"as_of_week": as_of, "week": week, "matchups": matchups, "season": season}
+    # Expected payouts ride along when the league has a buy-in/payout scheme configured.
+    # A bad payout config is reported next to the card instead of failing the whole odds call.
+    payout_data, payout_error = None, None
+    if cfg.get("buy_in") is not None and cfg.get("payouts"):
+        try:
+            payout_data = payouts.expected_payouts(
+                conn, league, as_of_week=as_of, std_fraction=std_fraction, n_sims=n_sims,
+            )
+        except ValueError as e:
+            payout_error = str(e)
+
+    return {"as_of_week": as_of, "week": week, "matchups": matchups, "season": season,
+            "payouts": payout_data, "payouts_error": payout_error}
 
 
 @app.post("/api/leagues/{league}/odds/calibrate")

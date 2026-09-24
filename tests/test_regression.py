@@ -612,3 +612,61 @@ def test_calibrate_std_fraction_recovers_known_noise(conn_calibration):
     assert result["std_fraction"] == pytest.approx(true_std, abs=0.06)
     assert abs(result["bias"]) < 0.1  # fixture has no built-in over/under-projection bias
     assert len(result["residuals"]) == 24
+
+def _payout_league():
+    return {"platform": "sleeper", "name": LEAGUE, "league_id": "x", "end_week": 2,
+            "playoff_teams": 2, "playoff_weeks": 1, "buy_in": 10,
+            "payouts": {"placement": {1: 20, 2: 5},
+                        "weekly_high": {"amount": 3, "start_week": 1, "end_week": 2}}}
+
+
+def test_podium_has_a_third_place_game_between_semifinal_losers():
+    seeds = [10, 20, 30, 40, 50, 60]
+    weekly = {
+        10: {13: 0.0, 14: 120.0, 15: 100.0},
+        20: {13: 0.0, 14: 95.0, 15: 0.0},
+        30: {13: 100.0, 14: 110.0, 15: 100.0},
+        40: {13: 80.0},
+        50: {13: 85.0, 14: 100.0, 15: 40.0},   # 50 (lost in round 2) upsets 20 in the 3rd-place game
+        60: {13: 90.0},
+    }
+    result = records.project_playoffs(seeds, weekly, first_week=13, playoff_weeks=3)
+    assert records.podium(result, weekly) == {"first": 10, "second": 30, "third": 50}
+    assert records.podium({"rounds": [], "champion": 7}, {}) == {"first": 7, "second": None, "third": None}
+
+
+def test_payout_settings_validation(monkeypatch):
+    monkeypatch.setattr(config, "LEAGUES", [{"name": "x", "end_week": 16}])
+    with pytest.raises(ValueError, match="buy_in and/or payouts"):
+        payouts.payout_settings("x")
+    monkeypatch.setattr(config, "LEAGUES", [{"name": "x", "end_week": 16, "buy_in": 5,
+                                             "payouts": {"placement": {4: 10}}}])
+    with pytest.raises(ValueError, match="1st-3rd"):
+        payouts.payout_settings("x")
+
+
+def test_expected_payouts_earned_plus_remaining(conn, monkeypatch):
+    monkeypatch.setattr(config, "LEAGUES", [_payout_league()])
+    # Week 1 is final: B (95) beat A (80) and took the week-1 high-score prize.
+    db.replace_schedule(conn, LEAGUE, [(1, 1, 2, 80.0, 95.0)])
+    out = payouts.expected_payouts(conn, LEAGUE, as_of_week=1, std_fraction=0.0, n_sims=10, seed=1)
+    by = {t["team_id"]: t for t in out["teams"]}
+
+    # B: 1-0 -> 1 seed; week 2 B (28) beats A (27) -> champion ($20) + week-2 high ($3)
+    assert by[2]["earned"] == pytest.approx(3.0)
+    assert by[2]["expected_remaining"] == pytest.approx(23.0)
+    assert by[2]["expected_total"] == pytest.approx(26.0)
+    assert by[2]["expected_net"] == pytest.approx(16.0)
+    # A: runner-up ($5), no weekly wins
+    assert by[1]["earned"] == pytest.approx(0.0)
+    assert by[1]["expected_total"] == pytest.approx(5.0)
+    assert by[1]["expected_net"] == pytest.approx(-5.0)
+    # every prize dollar gets paid to someone
+    assert sum(t["expected_total"] for t in out["teams"]) == pytest.approx(out["summary"]["total_prizes"])
+    assert out["summary"]["weekly_high_weeks_paid"] == 1
+
+
+def test_expected_payouts_requires_config_and_schedule(conn, monkeypatch):
+    monkeypatch.setattr(config, "LEAGUES", [_payout_league()])
+    with pytest.raises(ValueError, match="No regular-season schedule"):
+        payouts.expected_payouts(conn, LEAGUE)

@@ -115,7 +115,7 @@ def _simulate_once(schedule: list, weekly_means: dict, played: set, regular_seas
     seeds = records.seed_teams(recs)
     qualifiers = seeds[:playoff_teams]
     playoffs = records.project_playoffs(qualifiers, sampled, regular_season_weeks + 1, playoff_weeks)
-    return recs, seeds, qualifiers, playoffs
+    return recs, seeds, qualifiers, playoffs, sampled
 
 
 def project_league_probabilities(conn, league_key: str, end_week: int, regular_season_weeks: int,
@@ -163,7 +163,7 @@ def project_league_probabilities(conn, league_key: str, end_week: int, regular_s
     seed_sum = {tid: 0 for tid in team_ids}
 
     for _ in range(n_sims):
-        recs, seeds, qualifiers, playoffs = _simulate_once(
+        recs, seeds, qualifiers, playoffs, _sampled = _simulate_once(
             schedule, weekly_means, played, regular_season_weeks, playoff_teams, playoff_weeks,
             std_fraction, rng,
         )

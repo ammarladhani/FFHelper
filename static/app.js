@@ -61,6 +61,10 @@ function pillHTML(n, opts) {
   opts = opts || {};
   return `<span class="pill ${pillClass(n)}">${signed1(n)}${opts.suffix || ""}</span>`;
 }
+function money(n) { return (n === null || n === undefined) ? "—" : "$" + Number(n).toFixed(2); }
+function moneyPill(n) {
+  return `<span class="pill ${pillClass(n)}">${n >= 0 ? "+" : "−"}$${Math.abs(n).toFixed(2)}</span>`;
+}
 function spinnerRow(msg) {
   return `<div class="loading-row"><div class="spinner"></div><span>${esc(msg || "Working...")}</span></div>`;
 }
@@ -518,7 +522,7 @@ function renderRecords(data) {
 }
 
 /* ==========================================================================
-   VIEW: Win Probabilities
+   VIEW: Win Probabilities (+ expected payouts)
    ========================================================================== */
 
 function initOddsView() {
@@ -637,9 +641,60 @@ function renderOdds(data) {
         </table>
       </div>
       <div class="chart-box" style="margin-top:14px"><canvas id="odds-champ-chart"></canvas></div>
-    </div>`;
+    </div>
+    ${payoutsCardHTML(data)}`;
 
   barChart($("odds-champ-chart"), data.season.teams.map((r) => r.team_name), data.season.teams.map((r) => r.champion_pct), { color: "#e8b84a" });
+  if (data.payouts) {
+    barChart($("payouts-chart"), data.payouts.teams.map((t) => t.team_name),
+             data.payouts.teams.map((t) => t.expected_total), { color: "#46d488" });
+  }
+}
+
+function payoutsCardHTML(data) {
+  if (data.payouts_error) {
+    return `<div class="error-banner">Expected payouts unavailable: ${esc(data.payouts_error)}</div>`;
+  }
+  const p = data.payouts;
+  if (!p) return "";
+  const s = p.summary;
+  const me = p.teams.find((t) => t.team_id === state.teamId);
+
+  const poolWarn = Math.abs(s.total_prizes - s.total_buy_ins) > 0.005
+    ? `<div class="info-banner" style="margin-bottom:14px">Prizes total ${money(s.total_prizes)} but buy-ins total ${money(s.total_buy_ins)} (${s.n_teams} teams × ${money(s.buy_in)}) &mdash; double-check your payout config.</div>` : "";
+
+  const hero = me ? `
+    <div class="card-grid" style="margin-bottom:16px">
+      <div class="stat-card"><span class="label">Already earned</span><span class="value">${money(me.earned)}</span></div>
+      <div class="stat-card"><span class="label">Expected rest of season</span><span class="value">${money(me.expected_remaining)}</span></div>
+      <div class="stat-card"><span class="label">Expected total</span><span class="value positive">${money(me.expected_total)}</span></div>
+      <div class="stat-card"><span class="label">Net after ${money(me.buy_in)} buy-in</span><span class="value ${me.expected_net >= 0 ? "positive" : "negative"}">${(me.expected_net >= 0 ? "+" : "−") + money(Math.abs(me.expected_net))}</span></div>
+    </div>` : "";
+
+  const rows = p.teams.map((t) => `
+    <tr class="${t.team_id === state.teamId ? "me" : ""}">
+      <td>${esc(t.team_name)}</td><td>${esc(t.manager_name || "—")}</td>
+      <td class="num mono">${money(t.earned)}</td>
+      <td class="num mono">${money(t.expected_placement)}</td>
+      <td class="num mono">${money(t.expected_weekly_high)}</td>
+      <td class="num mono">${money(t.expected_total)}</td>
+      <td class="num">${moneyPill(t.expected_net)}</td>
+      <td class="num mono">${t.first_pct.toFixed(1)} / ${t.second_pct.toFixed(1)} / ${t.third_pct.toFixed(1)}%</td>
+    </tr>`).join("");
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h3>Expected payouts</h3>
+        <span class="card-sub">weekly-high weeks settled: ${s.weekly_high_weeks_paid}/${s.weekly_high_weeks_total}</span>
+      </div>
+      ${poolWarn}${hero}
+      <div class="table-wrap"><table>
+        <thead><tr><th>Team</th><th>Manager</th><th class="num">Earned</th><th class="num">ROS placement</th><th class="num">ROS weekly high</th><th class="num">Expected total</th><th class="num">Net</th><th class="num">1st / 2nd / 3rd</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      <div class="chart-box" style="margin-top:14px"><canvas id="payouts-chart"></canvas></div>
+    </div>`;
 }
 
 /* ==========================================================================

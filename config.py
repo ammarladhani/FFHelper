@@ -51,6 +51,10 @@ LEAGUES = [
         "end_week": 18,
         "playoff_teams": 8,          # TODO: fill in (e.g. 6)
         "playoff_weeks": 3,          # TODO: fill in (e.g. 3)
+        "buy_in": 15,
+        "payouts": {
+            "placement": {1: 100, 2: 65, 3: 15},
+        },
     },
     {
         "platform": "sleeper",
@@ -60,6 +64,12 @@ LEAGUES = [
         "end_week": 16,
         "playoff_teams": 6,          # TODO: fill in (e.g. 6)
         "playoff_weeks": 3,          # TODO: fill in (e.g. 3)
+        "buy_in": 30,
+        "payouts": {
+            "placement": {1: 60, 2: 30, 3: 10},
+            # $10 to the week's high scorer, weeks 1 through playoff round 1 (week 14)
+            "weekly_high": {"amount": 10, "start_week": 1, "end_week": 14},
+        },
     },
 ]
 
