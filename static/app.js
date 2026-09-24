@@ -144,15 +144,28 @@ const state = {
   endWeek: 1,
   weighted: false,
   decay: 0.9,
+  moneyMode: false,
+  moneyObjectiveAvailable: true,
   currentWeek: 1,
   leagueEndWeek: 1,
   lastRunScope: {}, // viewKey -> scope string, to flag stale results after a filter change
 };
 
-function decayOrNull() { return state.weighted ? state.decay : null; }
+function decayOrNull() { return state.weighted && !state.moneyMode ? state.decay : null; }
+function objective() { return state.moneyMode ? "money" : "points"; }
+function objectiveLabel() { return state.moneyMode ? "expected prize money" : "projected points"; }
+function objectiveGainValue(row) {
+  return state.moneyMode ? Number(row.money_gain || 0) : Number(row.projected_gain || 0);
+}
+function objectiveGainFormatted(rowOrValue) {
+  const value = typeof rowOrValue === "object"
+    ? objectiveGainValue(rowOrValue)
+    : Number(rowOrValue || 0);
+  return state.moneyMode ? moneyPill(value) : pillHTML(value, { suffix: " pts" });
+}
 
 function scopeKey(extra) {
-  return `${state.league}::${state.teamId}::${state.startWeek}-${state.endWeek}::${decayOrNull()}${extra ? "::" + extra : ""}`;
+  return `${state.league}::${state.teamId}::${state.startWeek}-${state.endWeek}::${decayOrNull()}::${objective()}${extra ? "::" + extra : ""}`;
 }
 
 function staleBanner(viewKey, extra) {
@@ -193,6 +206,20 @@ async function initSidebar() {
     updateDecayHint();
   });
 
+  $("money-toggle").addEventListener("change", (e) => {
+    state.moneyMode = e.target.checked;
+    if (state.moneyMode) {
+      state.weighted = false;
+      $("weight-toggle").checked = false;
+      $("weight-toggle").disabled = true;
+      $("decay-row").style.display = "none";
+    } else {
+      $("weight-toggle").disabled = false;
+      $("decay-row").style.display = state.weighted ? "block" : "none";
+    }
+    updateDecayHint();
+  });
+
   $("refresh-btn").addEventListener("click", runRefresh);
 
   if (leagues.length) await loadLeague(leagues[0].key);
@@ -216,6 +243,8 @@ async function loadLeague(leagueKey) {
   state.leagueEndWeek = meta.end_week;
   state.currentWeek = meta.current_week;
   state.decay = meta.default_decay;
+  state.moneyObjectiveAvailable = meta.money_objective_available !== false;
+  state.moneyMode = state.moneyMode && state.moneyObjectiveAvailable;
   state.teamId = meta.default_team_id || meta.teams[0].team_id;
   state.startWeek = meta.current_week;
   state.endWeek = meta.end_week;
@@ -234,6 +263,11 @@ async function loadLeague(leagueKey) {
   $("end-week").max = state.leagueEndWeek;
   $("week-hint").textContent = `Current week is ${state.currentWeek}. Season runs through week ${state.leagueEndWeek}.`;
   $("decay-slider").value = state.decay;
+  $("money-toggle").disabled = !state.moneyObjectiveAvailable;
+  $("money-toggle").checked = state.moneyMode;
+  $("weight-toggle").disabled = state.moneyMode;
+  $("weight-toggle").checked = state.weighted && !state.moneyMode;
+  $("decay-row").style.display = state.weighted && !state.moneyMode ? "block" : "none";
   $("current-week-badge").textContent = `Week ${state.currentWeek}`;
   $("team-name-label").textContent = teamLabel(state.teamId);
   updateDecayHint();
@@ -745,6 +779,7 @@ async function runWaiverPickups() {
       top_n: Number($("w-topn").value), by_position: byPos,
       fa_prefilter: Number($("w-fa").value), fa_per_position: Number($("w-fa-pp").value),
       decay: decayOrNull(),
+      objective: objective(),
     });
     const result = await pollJob(job_id, (j) => { prog.innerHTML = progressHTML(j, "Checking free agents..."); });
     prog.innerHTML = "";
@@ -780,7 +815,7 @@ function waiverPickCardHTML(p, i) {
           <span class="drop-name">${esc(drop)}</span>
         </div>
         <div style="display:flex;align-items:center;gap:10px">
-          ${pillHTML(p.projected_gain, { suffix: " pts" })}
+          ${objectiveGainFormatted(p)}
           ${p.add && p.drop ? `<button class="btn btn-ghost btn-sm explain-toggle" id="w-why-${i}">Why? ▾</button>` : ""}
         </div>
       </div>
@@ -799,6 +834,7 @@ async function toggleWaiverExplain(i, p) {
     const ex = await API.get(`/api/leagues/${state.league}/waiver/explain`, {
       team_id: state.teamId, add: p.add.player_id, drop: p.drop.player_id,
       start_week: state.startWeek, end_week: state.endWeek, decay: decayOrNull(),
+      objective: objective(),
     });
     const weeks = Object.keys(ex.weekly_before).map(Number).sort((a, b) => a - b);
     panel.innerHTML = `<div class="chart-box"><canvas id="w-explain-chart-${i}"></canvas></div>`;
@@ -822,6 +858,7 @@ async function runWaiverPlan() {
       team_id: state.teamId, start_week: state.startWeek, end_week: state.endWeek,
       by_position: byPos, fa_prefilter: Number($("w-fa").value), fa_per_position: Number($("w-fa-pp").value),
       decay: decayOrNull(),
+      objective: objective(),
     });
     const result = await pollJob(job_id, (j) => { prog.innerHTML = progressHTML(j, "Chaining moves..."); });
     prog.innerHTML = "";
@@ -836,40 +873,70 @@ async function runWaiverPlan() {
 
 function renderWaiverPlan(plan) {
   const results = $("w-plan-results");
+
   if (!plan.moves.length) {
-    results.innerHTML = `<div class="card"><div class="stat-card"><span class="label">Starting total</span><span class="value">${fmt1(plan.starting_total)}</span></div><p class="view-desc" style="margin-top:8px">No move found that improves your projected total.</p></div>`;
+    results.innerHTML = `
+      <div class="card">
+        <div class="stat-card">
+          <span class="label">Starting ${objectiveLabel()}</span>
+          <span class="value">${state.moneyMode ? money(plan.starting_money) : fmt1(plan.starting_projected_total)}</span>
+        </div>
+        <p class="view-desc" style="margin-top:8px">No move found that improves your ${objectiveLabel()}.</p>
+      </div>`;
     return;
   }
+
   const stepsHTML = plan.moves.map((m) => `
     <div class="move-card">
       <div class="pick-row">
         <div style="display:flex;align-items:center;gap:10px">
           <div class="step-badge">${m.step}</div>
           <div class="pick-players">
-            <span class="add-name">+ ${esc(m.add.name)}</span><span class="arrow">for</span><span class="drop-name">${esc(m.drop.name)}</span>
+            <span class="add-name">+ ${esc(m.add.name)}</span>
+            <span class="arrow">for</span>
+            <span class="drop-name">${esc(m.drop.name)}</span>
           </div>
         </div>
-        ${pillHTML(m.gain, { suffix: " pts" })}
+        ${state.moneyMode ? moneyPill(m.money_gain) : pillHTML(m.projected_gain, { suffix: " pts" })}
       </div>
     </div>`).join("");
+
+  const startingValue = state.moneyMode ? plan.starting_money : plan.starting_projected_total;
+  const finalValue = state.moneyMode ? plan.final_money : plan.final_projected_total;
+  const totalGain = state.moneyMode ? plan.total_money_gain : plan.total_projected_gain;
+  const runningValues = state.moneyMode
+    ? [plan.starting_money, ...plan.moves.map((m) => m.running_money)]
+    : [plan.starting_projected_total, ...plan.moves.map((m) => m.running_projected_total)];
 
   results.innerHTML = `
     <div class="card">
       <div class="card-grid">
-        <div class="stat-card"><span class="label">Starting total</span><span class="value">${fmt1(plan.starting_total)}</span></div>
-        <div class="stat-card"><span class="label">Final total</span><span class="value positive">${fmt1(plan.final_total)}</span></div>
-        <div class="stat-card"><span class="label">Total gain</span><span class="value positive">${signed1(plan.total_gain)}</span></div>
+        <div class="stat-card">
+          <span class="label">Starting ${objectiveLabel()}</span>
+          <span class="value">${state.moneyMode ? money(startingValue) : fmt1(startingValue)}</span>
+        </div>
+        <div class="stat-card">
+          <span class="label">Final ${objectiveLabel()}</span>
+          <span class="value positive">${state.moneyMode ? money(finalValue) : fmt1(finalValue)}</span>
+        </div>
+        <div class="stat-card">
+          <span class="label">Total gain</span>
+          ${state.moneyMode ? moneyPill(totalGain) : `<span class="value positive">${signed1(totalGain)}</span>`}
+        </div>
       </div>
     </div>
     <div class="list-stack">${stepsHTML}</div>
     <div class="card">
-      <div class="card-header"><h3>Running total</h3></div>
+      <div class="card-header"><h3>Running ${objectiveLabel()}</h3></div>
       <div class="chart-box"><canvas id="w-plan-chart"></canvas></div>
     </div>`;
 
-  const labels = ["Start", ...plan.moves.map((m) => `Step ${m.step}`)];
-  const values = [plan.starting_total, ...plan.moves.map((m) => m.running_total)];
-  lineChart($("w-plan-chart"), labels, [{ label: "Running total", data: values, color: "#46d488", fill: true }]);
+  lineChart($("w-plan-chart"), ["Start", ...plan.moves.map((m) => `Step ${m.step}`)], [{
+    label: state.moneyMode ? "Expected money" : "Projected points",
+    data: runningValues,
+    color: "#46d488",
+    fill: true,
+  }]);
 }
 
 /* ==========================================================================
@@ -932,6 +999,7 @@ async function runTradeFinder() {
       team_id: state.teamId, start_week: state.startWeek, end_week: state.endWeek,
       candidate_prefilter: Number($("t-prefilter").value),
       partner_team_id: partner ? Number(partner) : null, combo_sizes: sizes, decay: decayOrNull(),
+       objective: objective(),
     });
     const result = await pollJob(job_id, (j) => { prog.innerHTML = progressHTML(j, "Searching trade combinations..."); });
     prog.innerHTML = "";
@@ -1066,8 +1134,12 @@ function renderTradeResultsList(all) {
           <span class="get-list">Get: ${p.get.map((x) => esc(x.name)).join(", ")}</span>
         </div>
         <div style="display:flex;gap:8px;align-items:center">
-          <span class="pill positive">you ${signed1(p.my_delta)}</span>
-          <span class="pill positive">${esc(p.partner_team_name)} ${signed1(p.partner_delta)}</span>
+          ${state.moneyMode
+            ? `<span class="pill positive">you ${money(p.my_delta)}</span>`
+            : `<span class="pill positive">you ${signed1(p.my_delta)}</span>`}
+          ${state.moneyMode
+            ? `<span class="pill positive">${esc(p.partner_team_name)} ${money(p.partner_delta)}</span>`
+            : `<span class="pill positive">${esc(p.partner_team_name)} ${signed1(p.partner_delta)}</span>`}
         </div>
       </div>
     </div>`).join("");
@@ -1159,6 +1231,7 @@ async function runEvaluate() {
     const data = await API.post(`/api/leagues/${state.league}/trades/explain`, {
       team_a: state.teamId, give, team_b: partnerId, get,
       start_week: state.startWeek, end_week: state.endWeek, decay: decayOrNull(),
+       objective: objective(),
     });
     renderEvaluate(data, partnerId);
   } catch (e) {
@@ -1171,18 +1244,24 @@ async function runEvaluate() {
 function renderEvaluate(data, partnerId) {
   const results = $("e-results");
   const a = data.team_a, b = data.team_b;
+
+  const afterValue = (side) => state.moneyMode ? money(side.money_after) : fmt1(side.projected_after);
+  const deltaPill = (side) => state.moneyMode
+    ? moneyPill(side.money_delta)
+    : pillHTML(side.projected_delta, { suffix: " pts" });
+
   results.innerHTML = `
     <div class="card">
       <div class="card-grid">
         <div class="stat-card">
           <span class="label">${esc(teamLabel(state.teamId))}</span>
-          <span class="value ${a.raw_delta >= 0 ? "positive" : "negative"}">${fmt1(a.raw_total_after)}</span>
-          ${pillHTML(a.raw_delta, { suffix: " pts" })}
+          <span class="value ${a.delta >= 0 ? "positive" : "negative"}">${afterValue(a)}</span>
+          ${deltaPill(a)}
         </div>
         <div class="stat-card">
           <span class="label">${esc(teamLabel(partnerId))}</span>
-          <span class="value ${b.raw_delta >= 0 ? "positive" : "negative"}">${fmt1(b.raw_total_after)}</span>
-          ${pillHTML(b.raw_delta, { suffix: " pts" })}
+          <span class="value ${b.delta >= 0 ? "positive" : "negative"}">${afterValue(b)}</span>
+          ${deltaPill(b)}
         </div>
       </div>
     </div>
@@ -1193,6 +1272,7 @@ function renderEvaluate(data, partnerId) {
 
   const weeksA = Object.keys(a.weekly_before).map(Number).sort((x, y) => x - y);
   const weeksB = Object.keys(b.weekly_before).map(Number).sort((x, y) => x - y);
+
   lineChart($("e-chart-a"), weeksA.map((w) => `Wk ${w}`), [
     { label: "Before", data: weeksA.map((w) => a.weekly_before[w]), color: "#8b93a1" },
     { label: "After", data: weeksA.map((w) => a.weekly_after[w]), color: "#46d488" },

@@ -77,6 +77,19 @@ def _bad_request(e: ValueError):
     raise HTTPException(400, str(e))
 
 
+def _optimizer_objective(value: str) -> str:
+    value = (value or "points").strip().lower()
+    if value not in {"points", "money"}:
+        raise HTTPException(400, "objective must be 'points' or 'money'")
+    return value
+
+
+def _effective_decay(objective: str, decay: Optional[float]) -> Optional[float]:
+    # Money mode already accounts for time through the actual payout schedule,
+    # so recency weighting would create a second, conflicting weighting layer.
+    return None if objective == "money" else decay
+
+
 class _JobLogStream(io.TextIOBase):
     """Redirects print()'d lines from ingest.main() into a job's log so
     the frontend can show a live-scrolling refresh log, the rough
@@ -139,6 +152,7 @@ def league_meta(league: str):
         "default_team_id": cfg.get("my_team_id"),
         "default_decay": config.DEFAULT_DECAY,
         "default_std_fraction": config.DEFAULT_SCORE_STD_FRACTION,
+        "money_objective_available": bool(cfg.get("buy_in") is not None and cfg.get("payouts")),
     }
 
 
@@ -272,6 +286,7 @@ class WaiverPickupsRequest(BaseModel):
     fa_prefilter: int = waiver.DEFAULT_FA_PREFILTER
     fa_per_position: int = waiver.DEFAULT_FA_PER_POSITION
     decay: Optional[float] = None
+    objective: str = "points"
 
 
 @app.post("/api/leagues/{league}/waiver/pickups")
@@ -279,10 +294,17 @@ def waiver_pickups_start(league: str, req: WaiverPickupsRequest):
     _league_cfg(league)
 
     def _run(job: jobs.Job):
+        objective = _optimizer_objective(req.objective)
+        if objective == "money" and not (_league_cfg(league).get("buy_in") is not None and _league_cfg(league).get("payouts")):
+            raise ValueError(
+                f"League '{league}' has no payout scheme configured for money optimization."
+            )
         picks = waiver.best_pickups(
             conn, league, req.team_id, req.start_week, req.end_week,
             as_of_week=req.as_of_week, top_n=req.top_n, by_position=req.by_position,
-            fa_prefilter=req.fa_prefilter, fa_per_position=req.fa_per_position, decay=req.decay,
+            fa_prefilter=req.fa_prefilter, fa_per_position=req.fa_per_position,
+            decay=_effective_decay(objective, req.decay),
+            objective=objective,
             progress_callback=lambda *a, **kw: job.report(*a, **kw),
         )
         job.set_result({"picks": picks})
@@ -300,6 +322,7 @@ class WaiverPlanRequest(BaseModel):
     fa_per_position: int = waiver.DEFAULT_FA_PER_POSITION
     max_moves: int = 50
     decay: Optional[float] = None
+    objective: str = "points"
 
 
 @app.post("/api/leagues/{league}/waiver/plan")
@@ -307,10 +330,17 @@ def waiver_plan_start(league: str, req: WaiverPlanRequest):
     _league_cfg(league)
 
     def _run(job: jobs.Job):
+        objective = _optimizer_objective(req.objective)
+        if objective == "money" and not (_league_cfg(league).get("buy_in") is not None and _league_cfg(league).get("payouts")):
+            raise ValueError(
+                f"League '{league}' has no payout scheme configured for money optimization."
+            )
         plan = waiver.plan_waiver_moves(
             conn, league, req.team_id, req.start_week, req.end_week,
             as_of_week=req.as_of_week, by_position=req.by_position, fa_prefilter=req.fa_prefilter,
-            fa_per_position=req.fa_per_position, max_moves=req.max_moves, decay=req.decay,
+            fa_per_position=req.fa_per_position, max_moves=req.max_moves,
+            decay=_effective_decay(objective, req.decay),
+            objective=objective,
             progress_callback=lambda *a, **kw: job.report(*a, **kw),
         )
         job.set_result(plan)
@@ -320,11 +350,22 @@ def waiver_plan_start(league: str, req: WaiverPlanRequest):
 
 @app.get("/api/leagues/{league}/waiver/explain")
 def waiver_explain(league: str, team_id: int, add: str, drop: str, start_week: int, end_week: int,
-                    as_of_week: Optional[int] = None, decay: Optional[float] = None):
-    _league_cfg(league)
+                    as_of_week: Optional[int] = None, decay: Optional[float] = None,
+                    objective: str = "points"):
+    cfg = _league_cfg(league)
+    objective = _optimizer_objective(objective)
+    if objective == "money" and not (cfg.get("buy_in") is not None and cfg.get("payouts")):
+        raise HTTPException(
+            400,
+            f"League '{league}' has no payout scheme configured for money optimization.",
+        )
     try:
-        return waiver.explain_pickup(conn, league, team_id, add, drop, start_week, end_week,
-                                     as_of_week=as_of_week, decay=decay)
+        return waiver.explain_pickup(
+            conn, league, team_id, add, drop, start_week, end_week,
+            as_of_week=as_of_week,
+            decay=_effective_decay(objective, decay),
+            objective=objective,
+        )
     except ValueError as e:
         _bad_request(e)
 
@@ -340,6 +381,7 @@ class TradeSuggestRequest(BaseModel):
     partner_team_id: Optional[int] = None
     combo_sizes: List[int] = [1]
     decay: Optional[float] = None
+    objective: str = "points"
 
 
 @app.post("/api/leagues/{league}/trades/suggest")
@@ -347,11 +389,18 @@ def trade_suggest_start(league: str, req: TradeSuggestRequest):
     _league_cfg(league)
 
     def _run(job: jobs.Job):
+        objective = _optimizer_objective(req.objective)
+        if objective == "money" and not (_league_cfg(league).get("buy_in") is not None and _league_cfg(league).get("payouts")):
+            raise ValueError(
+                f"League '{league}' has no payout scheme configured for money optimization."
+            )
         proposals = trades.suggest_trades(
             conn, league, req.team_id, req.start_week, req.end_week, as_of_week=req.as_of_week,
             candidate_prefilter=req.candidate_prefilter, partner_team_id=req.partner_team_id,
             combo_sizes=tuple(sorted(set(req.combo_sizes))) or (1,),
-            decay=req.decay, progress_callback=lambda *a, **kw: job.report(*a, **kw),
+            decay=_effective_decay(objective, req.decay),
+            objective=objective,
+            progress_callback=lambda *a, **kw: job.report(*a, **kw),
         )
         job.set_result({"proposals": proposals})
 
@@ -367,15 +416,24 @@ class TradeEvaluateRequest(BaseModel):
     end_week: int
     as_of_week: Optional[int] = None
     decay: Optional[float] = None
+    objective: str = "points"
 
 
 @app.post("/api/leagues/{league}/trades/evaluate")
 def trade_evaluate(league: str, req: TradeEvaluateRequest):
     _league_cfg(league)
     try:
+        cfg = _league_cfg(league)
+        objective = _optimizer_objective(req.objective)
+        if objective == "money" and not (cfg.get("buy_in") is not None and cfg.get("payouts")):
+            raise ValueError(
+                f"League '{league}' has no payout scheme configured for money optimization."
+            )
         return trades.evaluate_trade(
             conn, league, req.team_a, req.give, req.team_b, req.get,
-            req.start_week, req.end_week, as_of_week=req.as_of_week, decay=req.decay,
+            req.start_week, req.end_week, as_of_week=req.as_of_week,
+            decay=_effective_decay(objective, req.decay),
+            objective=objective,
         )
     except ValueError as e:
         _bad_request(e)
@@ -385,9 +443,17 @@ def trade_evaluate(league: str, req: TradeEvaluateRequest):
 def trade_explain(league: str, req: TradeEvaluateRequest):
     _league_cfg(league)
     try:
+        cfg = _league_cfg(league)
+        objective = _optimizer_objective(req.objective)
+        if objective == "money" and not (cfg.get("buy_in") is not None and cfg.get("payouts")):
+            raise ValueError(
+                f"League '{league}' has no payout scheme configured for money optimization."
+            )
         return trades.explain_trade(
             conn, league, req.team_a, req.give, req.team_b, req.get,
-            req.start_week, req.end_week, as_of_week=req.as_of_week, decay=req.decay,
+            req.start_week, req.end_week, as_of_week=req.as_of_week,
+            decay=_effective_decay(objective, req.decay),
+            objective=objective,
         )
     except ValueError as e:
         _bad_request(e)

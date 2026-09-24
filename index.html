@@ -1,15 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Fantasy Football Optimizer</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏈</text></svg>" />
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css" />
-<script src="/static/chart.min.js"></script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fantasy Football Optimizer</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏈</text></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="/static/chart.min.js"></script>
 </head>
 <body>
 <div id="app">
@@ -20,7 +20,7 @@
       <div class="brand-mark">FF</div>
       <div class="brand-text">
         <div class="name">Fantasy Optimizer</div>
-        <div class="tag">lineup &middot; waiver &middot; trade engine</div>
+        <div class="tag">lineup · waiver · trade engine</div>
       </div>
     </div>
 
@@ -38,7 +38,7 @@
       <label class="field-label">Week range</label>
       <div class="week-range">
         <input type="number" id="start-week" min="1" />
-        <span>&rarr;</span>
+        <span>→</span>
         <input type="number" id="end-week" min="1" />
       </div>
       <div class="field-hint" id="week-hint"></div>
@@ -56,6 +56,20 @@
       <div id="decay-row" style="display:none">
         <input type="range" id="decay-slider" min="0.5" max="0.99" step="0.01" />
         <div class="field-hint" id="decay-hint"></div>
+      </div>
+    </div>
+
+    <div class="field-group">
+      <div class="toggle-row">
+        <label class="field-label" for="money-toggle" style="margin:0">Optimize for expected prize money</label>
+        <label class="switch">
+          <input type="checkbox" id="money-toggle" />
+          <span class="track"></span>
+          <span class="thumb"></span>
+        </label>
+      </div>
+      <div class="field-hint" id="money-hint">
+        Waiver and trade searches use expected weekly-high prizes plus expected 1st/2nd/3rd-place money.
       </div>
     </div>
 
@@ -85,7 +99,7 @@
       <div class="view-header">
         <div>
           <h2>Projected standings</h2>
-          <div class="view-desc">Every team's optimal-lineup total across the selected week range, using the actual weekly-assignment lineup optimizer &mdash; not a greedy slot fill.</div>
+          <div class="view-desc">Every team's optimal-lineup total across the selected week range, using the actual weekly-assignment lineup optimizer — not a greedy slot fill.</div>
         </div>
         <button class="btn btn-primary" id="standings-run">Run simulation</button>
       </div>
@@ -107,7 +121,7 @@
       <div class="view-header">
         <div>
           <h2>Win probabilities</h2>
-          <div class="view-desc">Monte Carlo replay of the season, treating each team's weekly score as uncertain rather than exact &mdash; gives an actual percentage instead of a deterministic bracket. For leagues with a buy-in and payout scheme in config.py, it also shows expected prize money: what you've already earned plus what's expected for the rest of the season.</div>
+          <div class="view-desc">Monte Carlo replay of the season, treating each team's weekly score as uncertain rather than exact — gives an actual percentage instead of a deterministic bracket. For leagues with a buy-in and payout scheme in config.py, it also shows expected prize money: what you've already earned plus what's expected for the rest of the season.</div>
         </div>
       </div>
       <div id="odds-body"></div>
@@ -117,7 +131,7 @@
       <div class="view-header">
         <div>
           <h2>Waiver wire</h2>
-          <div class="view-desc">Tests every free agent against every roster spot and ranks by season-total gain.</div>
+          <div class="view-desc">Tests every free agent against every roster spot and ranks by season-total gain, or by expected prize-money gain when the money toggle is on.</div>
         </div>
       </div>
       <div id="waiver-body"></div>
@@ -127,7 +141,7 @@
       <div class="view-header">
         <div>
           <h2>Trade finder</h2>
-          <div class="view-desc">Searches swaps with every other team, keeping only trades where BOTH sides' projected totals improve.</div>
+          <div class="view-desc">Searches swaps with every other team, keeping only trades where BOTH sides improve under the selected objective.</div>
         </div>
       </div>
       <div id="trades-body"></div>
@@ -137,7 +151,7 @@
       <div class="view-header">
         <div>
           <h2>Evaluate a trade</h2>
-          <div class="view-desc">Pick players on each side and see the exact before/after impact for both teams.</div>
+          <div class="view-desc">Pick players on each side and see the exact before/after impact for both teams under the selected objective.</div>
         </div>
       </div>
       <div id="evaluate-body"></div>
@@ -152,10 +166,8 @@
       </div>
       <div id="rosters-body"></div>
     </section>
-
   </main>
 </div>
-
 <script src="/static/app.js"></script>
 </body>
 </html>
