@@ -89,16 +89,11 @@ WEEK_1_START = date(2026, 9, 6)
 # 0.9 -> each week further out is worth 90% of the one before it.
 DEFAULT_DECAY = 0.9
 
-# Monte Carlo win-probability simulation (see win_probability.py). Ingestion
-# only stores a point PROJECTION per team-week, not any measure of how much
-# that projection has actually varied historically - there's no real
-# week-to-week variance data to calibrate against. So a team's score in a
-# not-yet-played week is modeled there as Normal(mean=projection,
-# stdev=DEFAULT_SCORE_STD_FRACTION * mean), a simplifying, adjustable
-# assumption rather than a fitted model. 0.20 is a reasonable fantasy
-# football ballpark (raise it for more upsets/less confident favorites).
+# Win-probability model (see win_probability.py). Ingestion stores only a point
+# PROJECTION per team-week, so a not-yet-played score is modeled as
+# Normal(mean=projection, stdev=DEFAULT_SCORE_STD_FRACTION * mean) - an adjustable
+# assumption, not a fitted model (`cli.py calibrate` can estimate it from played weeks).
 DEFAULT_SCORE_STD_FRACTION = 0.20
-DEFAULT_N_SIMS = 2000
 
 
 def require_espn_credentials():

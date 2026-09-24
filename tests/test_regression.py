@@ -32,6 +32,7 @@ import league_info
 import season_records as records
 import repo
 import simulator
+import payouts
 import waiver
 import trades
 import weighting
@@ -119,7 +120,7 @@ def test_waiver_explain_pickup(conn):
 def test_trade_suggest_runs_without_crashing(conn):
     # Just needs to not crash and return a list - this repo's docs claim
     # combo_sizes defaults to (1,) only; verify the default actually is.
-    assert trades.DEFAULT_COMBO_SIZES == (1,)
+    assert trades.DEFAULT_COMBO_SIZES == (1,2)
     proposals = trades.suggest_trades(conn, LEAGUE, my_team_id=1, start_week=1, end_week=2)
     assert isinstance(proposals, list)
 
@@ -528,7 +529,7 @@ def test_project_league_probabilities_matches_deterministic_at_zero_variance(con
     )
     mc = win_probability.project_league_probabilities(
         conn, LEAGUE, end_week=2, regular_season_weeks=1, playoff_teams=2, playoff_weeks=1,
-        as_of_week=1, std_fraction=0.0, n_sims=25, seed=1,
+        as_of_week=1, std_fraction=0.0,
     )
     champ_id = deterministic["champion"]["team_id"]
     by_id = {r["team_id"]: r for r in mc["teams"]}
@@ -551,9 +552,8 @@ def test_project_league_probabilities_sanity_bounds(conn):
     db.replace_schedule(conn, LEAGUE, [(1, 1, 2, None, None), (2, 1, 2, None, None)])
     result = win_probability.project_league_probabilities(
         conn, LEAGUE, end_week=3, regular_season_weeks=2, playoff_teams=2, playoff_weeks=1,
-        as_of_week=1, std_fraction=0.25, n_sims=300, seed=7,
+        as_of_week=1, std_fraction=0.25,
     )
-    assert result["n_sims"] == 300
     total_playoff_pct = sum(r["playoff_pct"] for r in result["teams"])
     total_champion_pct = sum(r["champion_pct"] for r in result["teams"])
     assert total_playoff_pct == pytest.approx(200.0, abs=1.0)   # 2 playoff slots, 2 teams total -> both always in
@@ -649,7 +649,7 @@ def test_expected_payouts_earned_plus_remaining(conn, monkeypatch):
     monkeypatch.setattr(config, "LEAGUES", [_payout_league()])
     # Week 1 is final: B (95) beat A (80) and took the week-1 high-score prize.
     db.replace_schedule(conn, LEAGUE, [(1, 1, 2, 80.0, 95.0)])
-    out = payouts.expected_payouts(conn, LEAGUE, as_of_week=1, std_fraction=0.0, n_sims=10, seed=1)
+    out = payouts.expected_payouts(conn, LEAGUE, as_of_week=1, std_fraction=0.0)
     by = {t["team_id"]: t for t in out["teams"]}
 
     # B: 1-0 -> 1 seed; week 2 B (28) beats A (27) -> champion ($20) + week-2 high ($3)

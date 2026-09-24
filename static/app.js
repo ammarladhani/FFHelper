@@ -220,7 +220,6 @@ async function loadLeague(leagueKey) {
   state.startWeek = meta.current_week;
   state.endWeek = meta.end_week;
   state.oddsStdFraction = meta.default_std_fraction || 0.2;
-  state.oddsNSims = meta.default_n_sims || 2000;
   state.lastRunScope = {};
 
   const teamSel = $("team-select");
@@ -308,7 +307,7 @@ async function runRefresh() {
 const VIEWS = [
   { key: "standings", label: "Standings", icon: "📊", crumb: "Season projection" },
   { key: "records", label: "Projected Records", icon: "🏆", crumb: "Records & playoffs" },
-  { key: "odds", label: "Win Probabilities", icon: "🎲", crumb: "Monte Carlo odds" },
+  { key: "odds", label: "Win Probabilities", icon: "🎲", crumb: "Season odds" },
   { key: "waiver", label: "Waiver Wire", icon: "🔄", crumb: "Free agent search" },
   { key: "trades", label: "Trade Finder", icon: "🤝", crumb: "Win-win search" },
   { key: "evaluate", label: "Evaluate Trade", icon: "⚖️", crumb: "Specific trade" },
@@ -541,12 +540,6 @@ function initOddsView() {
           <div class="field-hint" id="odds-std-label"></div>
         </div>
         <div class="field-group">
-          <label class="field-label">Simulations</label>
-          <select id="odds-nsims">
-            ${[500, 1000, 2000, 5000, 10000, 20000, 50000, 100000].map((n) => `<option value="${n}">${n.toLocaleString()}</option>`).join("")}
-          </select>
-        </div>
-        <div class="field-group">
           <label class="field-label">Matchup odds for week</label>
           <input type="number" id="odds-week" min="1" />
         </div>
@@ -565,9 +558,6 @@ function refreshOddsDefaults() {
   $("odds-std-label").textContent = `±${$("odds-std").value / 10}% of projection`;
   $("odds-week").value = state.startWeek;
   $("odds-week").max = state.leagueEndWeek;
-  if (state.oddsNSims && $("odds-nsims").querySelector(`option[value="${state.oddsNSims}"]`)) {
-    $("odds-nsims").value = state.oddsNSims;
-  }
 }
 
 async function runCalibrate() {
@@ -587,11 +577,11 @@ async function runOdds() {
   const results = $("odds-results");
   const btn = $("odds-run");
   btn.disabled = true;
-  results.innerHTML = spinnerRow("Simulating the season many times...");
+  results.innerHTML = spinnerRow("Calculating odds...");
   try {
     const data = await API.get(`/api/leagues/${state.league}/odds`, {
       week: $("odds-week").value, as_of_week: state.startWeek,
-      std_fraction: Number($("odds-std").value) / 1000, n_sims: $("odds-nsims").value,
+      std_fraction: Number($("odds-std").value) / 1000,
     });
     renderOdds(data);
   } catch (e) {
@@ -633,7 +623,7 @@ function renderOdds(data) {
       ${matchupsHTML}
     </div>
     <div class="card">
-      <div class="card-header"><h3>Season-long odds</h3><span class="card-sub">${data.season.n_sims.toLocaleString()} simulations</span></div>
+      <div class="card-header"><h3>Season-long odds</h3><span class="card-sub">exact win totals &middot; analytic bracket</span></div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Team</th><th>Manager</th><th class="num">Playoffs</th><th class="num">Champion</th><th class="num">Avg record</th><th class="num">Avg seed</th></tr></thead>

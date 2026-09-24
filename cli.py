@@ -275,14 +275,11 @@ def cmd_odds(args, conn):
               f"{m['win_prob_b'] * 100:5.1f}%  {names[m['team_b']]:<25}")
 
     try:
-        result = win_probability.project_league_probabilities(
-            conn, args.league, ps["end_week"], ps["regular_season_weeks"], ps["playoff_teams"],
-            ps["playoff_weeks"], as_of_week=as_of, std_fraction=args.std_fraction, n_sims=args.n_sims,
-        )
+        result = win_probability.project_league_probabilities( conn, args.league, ps["end_week"], ps["regular_season_weeks"], ps["playoff_teams"], ps["playoff_weeks"], as_of_week=as_of, std_fraction=args.std_fraction, )
     except ValueError as e:
         raise SystemExit(f"error: {e}")
 
-    print(f"\nSeason-long odds (simulated {args.n_sims:,} times):\n")
+    print(f"\nSeason-long odds:\n")
     print(f"  {'Team':<25}{'Playoffs%':>11}{'Champ%':>9}{'Avg record':>13}{'Avg seed':>10}")
     for r in result["teams"]:
         avg_record = f"{r['avg_wins']:.1f}-{r['avg_losses']:.1f}"
@@ -293,14 +290,12 @@ def cmd_payouts(args, conn):
     try:
         ps = league_info.playoff_settings(args.league)
         as_of = args.as_of_week or league_info.current_week(last_week=ps["end_week"])
-        result = payouts.expected_payouts(conn, args.league, as_of_week=as_of,
-                                          std_fraction=args.std_fraction, n_sims=args.n_sims)
+        result = payouts.expected_payouts(conn, args.league, as_of_week=as_of, std_fraction=args.std_fraction)
     except ValueError as e:
         raise SystemExit(f"error: {e}")
 
     s = result["summary"]
-    print(f"\nExpected payouts for {args.league} (buy-in ${s['buy_in']:g}, {s['n_sims']:,} sims, "
-          f"weekly-high weeks settled: {s['weekly_high_weeks_paid']}/{s['weekly_high_weeks_total']}):\n")
+    print(f"\nExpected payouts for {args.league} (buy-in ${s['buy_in']:g}, " f"weekly-high weeks settled: {s['weekly_high_weeks_paid']}/{s['weekly_high_weeks_total']}):\n")
     print(f"  {'Team':<25}{'Earned':>9}{'ROS EV':>9}{'Total EV':>10}{'Net EV':>9}{'1st%':>7}{'2nd%':>7}{'3rd%':>7}")
     for r in result["teams"]:
         print(f"  {r['team_name']:<25}{r['earned']:>9.2f}{r['expected_remaining']:>9.2f}"
@@ -422,7 +417,7 @@ def build_parser():
                    help="project forward from this week's rosters (default: the current week)")
     p.set_defaults(func=cmd_records)
 
-    p = sub.add_parser("odds", help="matchup win probabilities and season-long championship odds (Monte Carlo)")
+    p = sub.add_parser("odds", help="matchup win probabilities and season-long championship odds")
     p.add_argument("--league", required=True, help="league key from config.py")
     p.add_argument("--as-of-week", type=int, dest="as_of_week", default=None,
                    help="project forward from this week's rosters (default: the current week)")
@@ -433,8 +428,6 @@ def build_parser():
                    help=f"weekly score stdev as a fraction of the projection "
                         f"(default {config.DEFAULT_SCORE_STD_FRACTION:g} - see win_probability.py "
                         f"for what this assumes)")
-    p.add_argument("--n-sims", type=int, dest="n_sims", default=config.DEFAULT_N_SIMS,
-                   help=f"number of Monte Carlo season replays (default {config.DEFAULT_N_SIMS})")
     p.set_defaults(func=cmd_odds)
 
     p = sub.add_parser("calibrate", help="estimate a data-driven --std-fraction from this league's own "
@@ -449,7 +442,6 @@ def build_parser():
     p.add_argument("--as-of-week", type=int, dest="as_of_week", default=None)
     p.add_argument("--std-fraction", type=float, dest="std_fraction",
                    default=config.DEFAULT_SCORE_STD_FRACTION)
-    p.add_argument("--n-sims", type=int, dest="n_sims", default=config.DEFAULT_N_SIMS)
     p.set_defaults(func=cmd_payouts)
 
     return parser

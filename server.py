@@ -139,7 +139,6 @@ def league_meta(league: str):
         "default_team_id": cfg.get("my_team_id"),
         "default_decay": config.DEFAULT_DECAY,
         "default_std_fraction": config.DEFAULT_SCORE_STD_FRACTION,
-        "default_n_sims": config.DEFAULT_N_SIMS,
     }
 
 
@@ -216,8 +215,7 @@ def projected_records(league: str, as_of_week: Optional[int] = None):
 
 @app.get("/api/leagues/{league}/odds")
 def odds(league: str, week: int, as_of_week: Optional[int] = None,
-         std_fraction: float = config.DEFAULT_SCORE_STD_FRACTION,
-         n_sims: int = config.DEFAULT_N_SIMS):
+         std_fraction: float = config.DEFAULT_SCORE_STD_FRACTION):
     cfg = _league_cfg(league)
     try:
         ps = league_info.playoff_settings(league)
@@ -236,10 +234,7 @@ def odds(league: str, week: int, as_of_week: Optional[int] = None,
         m["team_b_name"] = names.get(m["team_b"])
 
     try:
-        season = win_probability.project_league_probabilities(
-            conn, league, ps["end_week"], ps["regular_season_weeks"], ps["playoff_teams"],
-            ps["playoff_weeks"], as_of_week=as_of, std_fraction=std_fraction, n_sims=n_sims,
-        )
+        season = win_probability.project_league_probabilities(conn, league, ps["end_week"], ps["regular_season_weeks"],  ps["playoff_teams"], ps["playoff_weeks"], as_of_week=as_of, std_fraction=std_fraction)
     except ValueError as e:
         _bad_request(e)
 
@@ -248,9 +243,7 @@ def odds(league: str, week: int, as_of_week: Optional[int] = None,
     payout_data, payout_error = None, None
     if cfg.get("buy_in") is not None and cfg.get("payouts"):
         try:
-            payout_data = payouts.expected_payouts(
-                conn, league, as_of_week=as_of, std_fraction=std_fraction, n_sims=n_sims,
-            )
+            payout_data = payouts.expected_payouts(conn, league, as_of_week=as_of, std_fraction=std_fraction)
         except ValueError as e:
             payout_error = str(e)
 
