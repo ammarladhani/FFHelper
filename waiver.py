@@ -45,8 +45,10 @@ import logging
 import time
 from typing import Callable, Optional
 
+import objectives
 import repo
 import payouts
+from simulator import simulate_roster
 
 logger = logging.getLogger(__name__)
 
@@ -96,10 +98,7 @@ def _search_pickups(
     The point metrics are still returned in money mode so the UI can show
     the old point impact alongside the new objective.
     """
-    from simulator import simulate_roster
-    objective = (objective or "points").lower()
-    if objective not in {"points", "money"}:
-        raise ValueError("objective must be 'points' or 'money'")
+    objective = objectives.normalize_objective(objective)
     if objective == "money" and money_context is None:
         raise ValueError("Money objective requires a valid payout configuration.")
 
@@ -217,13 +216,12 @@ def _search_pickups(
         })
 
         if progress_callback:
-            label = (
-                f"+${best_objective_gain:.2f}"
-                if objective == "money" and best_objective_gain is not None
-                else f"+{best_objective_gain:.1f}"
-                if best_objective_gain is not None
-                else ""
-            )
+            if objective == "money" and best_objective_gain is not None:
+                label = f"+${best_objective_gain:.2f}"
+            elif best_objective_gain is not None:
+                label = f"+{best_objective_gain:.1f}"
+            else:
+                label = ""
             progress_callback(
                 i,
                 total_fa,
@@ -256,10 +254,7 @@ def best_pickups(
 ) -> list:
     total_start = time.perf_counter()
     as_of_week = as_of_week or start_week
-
-    objective = (objective or "points").lower()
-    if objective not in {"points", "money"}:
-        raise ValueError("objective must be 'points' or 'money'")
+    objective = objectives.normalize_objective(objective)
 
     slot_counts = repo.get_slot_counts(conn, league_key)
     current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
@@ -340,11 +335,8 @@ def plan_waiver_moves(
     gain. End-of-season placement money is included automatically, as are
     all configured future weekly-high prizes.
     """
-    from simulator import simulate_roster
     as_of_week = as_of_week or start_week
-    objective = (objective or "points").lower()
-    if objective not in {"points", "money"}:
-        raise ValueError("objective must be 'points' or 'money'")
+    objective = objectives.normalize_objective(objective)
 
     slot_counts = repo.get_slot_counts(conn, league_key)
     current_ids = repo.get_roster_player_ids(conn, league_key, team_id, as_of_week)
@@ -553,11 +545,8 @@ def explain_pickup(
     In money mode, the response also includes the before/after expected
     prize-money totals and their delta.
     """
-    from simulator import simulate_roster
     as_of_week = as_of_week or start_week
-    objective = (objective or "points").lower()
-    if objective not in {"points", "money"}:
-        raise ValueError("objective must be 'points' or 'money'")
+    objective = objectives.normalize_objective(objective)
 
     reserved_ids = repo.get_reserved_player_ids(conn, league_key, team_id, as_of_week)
     if drop_player_id in reserved_ids:

@@ -9,6 +9,7 @@ weekly), run `python cli.py debug-raw` to dump a raw response and
 we'll adjust the field paths.
 """
 
+import json
 import logging
 
 import requests
@@ -31,21 +32,38 @@ def _cookies(league_cfg):
 
 
 def _build_player_filter(stat_id: str, week: int, season: int, offset: int) -> str:
-    return (
-        '{"players":{'
-        '"filterStatsForSplitTypeIds":{"value":[0,1]},'
-        '"filterSlotIds":{"value":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,23,24]},'
-        '"filterStatsForSourceIds":{"value":[0,1]},'
-        '"useFullProjectionTable":{"value":true},'
-        f'"sortAppliedStatTotal":{{"sortAsc":false,"sortPriority":3,"value":"{stat_id}"}},'
-        '"sortPercOwned":{"sortPriority":4,"sortAsc":false},'
-        f'"limit":{PAGE_SIZE},'
-        f'"offset":{offset},'
-        '"filterRanksForSlotIds":{"value":[0,2,4,6,17,16,8,9,10,12,13,24,11,14,15]},'
-        f'"filterStatsForTopScoringPeriodIds":{{"value":{week},"additionalValue":'
-        f'["00{season}","10{season}","00{season-1}","{stat_id}","02{season}"]}}'
-        '}}'
-    )
+    """
+    Built as a real dict and serialized with json.dumps, rather than
+    hand-interpolated into a JSON-looking string. The old version
+    constructed this by string formatting, which happened to be safe only
+    because every value going into it was a plain int - the moment anything
+    string-shaped needing escaping went in here, that approach would
+    silently produce malformed JSON instead of raising.
+    """
+    filter_obj = {
+        "players": {
+            "filterStatsForSplitTypeIds": {"value": [0, 1]},
+            "filterSlotIds": {
+                "value": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24]
+            },
+            "filterStatsForSourceIds": {"value": [0, 1]},
+            "useFullProjectionTable": {"value": True},
+            "sortAppliedStatTotal": {"sortAsc": False, "sortPriority": 3, "value": stat_id},
+            "sortPercOwned": {"sortPriority": 4, "sortAsc": False},
+            "limit": PAGE_SIZE,
+            "offset": offset,
+            "filterRanksForSlotIds": {
+                "value": [0, 2, 4, 6, 17, 16, 8, 9, 10, 12, 13, 24, 11, 14, 15]
+            },
+            "filterStatsForTopScoringPeriodIds": {
+                "value": week,
+                "additionalValue": [
+                    f"00{season}", f"10{season}", f"00{season - 1}", stat_id, f"02{season}",
+                ],
+            },
+        }
+    }
+    return json.dumps(filter_obj)
 
 
 def fetch_players_week(league_cfg, season: int, week: int) -> list:
@@ -60,6 +78,11 @@ def fetch_players_week(league_cfg, season: int, week: int) -> list:
     warning and silently returned a partial/empty player list, which
     made a bad session cookie look identical to "nobody's a free agent
     this week" during ingestion.
+
+    Returns just the player list. This used to also return the `stat_id`
+    used to build the request filter, but nothing anywhere consumed that
+    second value - every caller unpacked it and immediately discarded it -
+    so it's been dropped rather than left as dead output.
     """
     stat_id = f"11{season}{week}"
     base_url = _base_url(league_cfg, season)
@@ -101,7 +124,7 @@ def fetch_players_week(league_cfg, season: int, week: int) -> list:
             break
         offset += PAGE_SIZE
 
-    return all_players, stat_id
+    return all_players
 
 
 def fetch_league_settings(league_cfg, season: int) -> dict:

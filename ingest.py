@@ -47,7 +47,7 @@ def ingest_espn_league_settings(conn, league_cfg, league_key, season):
 
 
 def fetch_espn_week_data(league_cfg, season, week):
-    players, stat_id = espn_client.fetch_players_week(league_cfg, season, week)
+    players = espn_client.fetch_players_week(league_cfg, season, week)
     roster_slots = espn_client.fetch_roster_slots(league_cfg, season, week)
     return week, players, roster_slots
 

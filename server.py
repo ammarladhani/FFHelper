@@ -42,6 +42,7 @@ import config
 import db
 import ingest
 import jobs
+import objectives
 import payouts
 import league_info
 import repo
@@ -104,10 +105,10 @@ def _bad_request(e: ValueError):
 
 
 def _optimizer_objective(value: str) -> str:
-    value = (value or "points").strip().lower()
-    if value not in {"points", "money"}:
-        raise HTTPException(400, "objective must be 'points' or 'money'")
-    return value
+    try:
+        return objectives.normalize_objective(value)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 def _effective_decay(objective: str, decay: Optional[float]) -> Optional[float]:
@@ -391,11 +392,10 @@ def waiver_explain(league: str, team_id: int, add: str, drop: str, start_week: i
                     objective: str = "points"):
     cfg = _league_cfg(league)
     objective = _optimizer_objective(objective)
-    if objective == "money" and not (cfg.get("buy_in") is not None and cfg.get("payouts")):
-        raise HTTPException(
-            400,
-            f"League '{league}' has no payout scheme configured for money optimization.",
-        )
+    try:
+        _require_money_objective(cfg, league, objective)
+    except ValueError as e:
+        _bad_request(e)
     with get_conn() as conn:
         try:
             return waiver.explain_pickup(
@@ -462,11 +462,10 @@ class TradeEvaluateRequest(BaseModel):
 def trade_evaluate(league: str, req: TradeEvaluateRequest):
     cfg = _league_cfg(league)
     objective = _optimizer_objective(req.objective)
-    if objective == "money" and not (cfg.get("buy_in") is not None and cfg.get("payouts")):
-        raise HTTPException(
-            400,
-            f"League '{league}' has no payout scheme configured for money optimization.",
-        )
+    try:
+        _require_money_objective(cfg, league, objective)
+    except ValueError as e:
+        _bad_request(e)
     with get_conn() as conn:
         try:
             return trades.evaluate_trade(
@@ -483,11 +482,10 @@ def trade_evaluate(league: str, req: TradeEvaluateRequest):
 def trade_explain(league: str, req: TradeEvaluateRequest):
     cfg = _league_cfg(league)
     objective = _optimizer_objective(req.objective)
-    if objective == "money" and not (cfg.get("buy_in") is not None and cfg.get("payouts")):
-        raise HTTPException(
-            400,
-            f"League '{league}' has no payout scheme configured for money optimization.",
-        )
+    try:
+        _require_money_objective(cfg, league, objective)
+    except ValueError as e:
+        _bad_request(e)
     with get_conn() as conn:
         try:
             return trades.explain_trade(
@@ -578,7 +576,11 @@ class MovePlayerRequest(BaseModel):
 def move_player(league: str, req: MovePlayerRequest):
     _league_cfg(league)
     with get_conn() as conn:
-        rows_updated = db.move_player(conn, league, req.player_id, req.to_team_id, req.from_week)
+        # db.move_player no longer commits internally (it now follows the
+        # same "caller wraps in `with conn:`" convention as the rest of
+        # db.py's write helpers), so this wrap is required here now.
+        with conn:
+            rows_updated = db.move_player(conn, league, req.player_id, req.to_team_id, req.from_week)
     if rows_updated == 0:
         raise HTTPException(
             400,

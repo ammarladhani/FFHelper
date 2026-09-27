@@ -197,6 +197,12 @@ def replace_schedule(conn, league_key, matchups):
     been played and None otherwise. Deleting first (rather than upserting)
     keeps re-ingestion idempotent even if the platform reshuffled a
     matchup.
+
+    Like every other write helper in this module, committing is the
+    CALLER's job (wrap the call in `with conn:`) - see ingest.ingest_schedule.
+    This used to call conn.commit() itself, which was inconsistent with
+    every upsert_* function above it and, since its one real caller already
+    wraps it in `with conn:`, was also a redundant second commit.
     """
     conn.execute("DELETE FROM schedule WHERE league_key = ?", (league_key,))
     conn.executemany(
@@ -204,7 +210,6 @@ def replace_schedule(conn, league_key, matchups):
         "VALUES (?, ?, ?, ?, ?, ?)",
         [(league_key, w, a, b, sa, sb) for (w, a, b, sa, sb) in matchups],
     )
-    conn.commit()
 
 
 def move_player(conn, league_key: str, player_id: str, new_team_id, from_week: int) -> int:
@@ -214,12 +219,12 @@ def move_player(conn, league_key: str, player_id: str, new_team_id, from_week: i
     week already sitting in the ownership table.
 
     This is a local-only override for the "move a player" UI control in
-    app.py's Rosters tab - it doesn't talk to ESPN/Sleeper at all, it
-    just edits the ownership rows that simulator.py/waiver.py/trades.py
-    already read from. It intentionally updates every week >= from_week
-    (not just one), since the whole point is to change what the season
-    simulation assumes the roster looks like going forward - a single
-    week's ownership row wouldn't affect any of those season totals.
+    server.py's roster/move endpoint - it doesn't talk to ESPN/Sleeper at
+    all, it just edits the ownership rows that simulator.py/waiver.py/
+    trades.py already read from. It intentionally updates every week >=
+    from_week (not just one), since the whole point is to change what the
+    season simulation assumes the roster looks like going forward - a
+    single week's ownership row wouldn't affect any of those season totals.
 
     Clears any IR/Taxi `reserved` flag on the affected rows: a manual
     move is by definition putting the player on an active roster spot
@@ -231,6 +236,12 @@ def move_player(conn, league_key: str, player_id: str, new_team_id, from_week: i
     ingested week. That's expected - this is a scratch/what-if edit,
     not a substitute for actually making the move on ESPN/Sleeper.
 
+    Like every other write helper in this module, committing is the
+    CALLER's job - wrap the call in `with conn:` (server.py's
+    /roster/move endpoint does this). This used to commit internally,
+    which was the one write helper here that didn't follow that
+    convention; the caller in server.py has been updated to wrap it.
+
     Returns the number of ownership rows updated (0 usually means
     from_week is later than every ingested week for this league, or
     the player has no ownership rows in this league at all).
@@ -240,5 +251,4 @@ def move_player(conn, league_key: str, player_id: str, new_team_id, from_week: i
         "WHERE league_key = ? AND player_id = ? AND week >= ?",
         (new_team_id, league_key, player_id, from_week),
     )
-    conn.commit()
     return cur.rowcount

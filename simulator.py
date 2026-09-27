@@ -75,6 +75,10 @@ def simulate_team_season(conn, league_key: str, team_id: int, start_week: int,
 def simulate_all_teams(conn, league_key: str, start_week: int, end_week: int,
                         as_of_week: int = None, decay: Optional[float] = None) -> dict:
     teams = repo.get_teams(conn, league_key)
+    # Slot counts are a league-wide setting, not a per-team one, so this is
+    # fetched once here - it used to be re-queried on every iteration of the
+    # loop below for no reason, since it can't change from team to team.
+    slot_counts = repo.get_slot_counts(conn, league_key)
     # Shared across every team - rosters differ, but player info/eligibility
     # doesn't, and there's plenty of cross-team overlap in projections
     # fetched per week too.
@@ -85,7 +89,6 @@ def simulate_all_teams(conn, league_key: str, start_week: int, end_week: int,
     for team in teams:
         as_of = as_of_week or start_week
         player_ids = repo.get_roster_player_ids(conn, league_key, team["team_id"], as_of)
-        slot_counts = repo.get_slot_counts(conn, league_key)
         sim = simulate_roster(
             conn, league_key, player_ids, slot_counts, start_week, end_week,
             player_info_cache=player_info_cache,
