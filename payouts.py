@@ -19,6 +19,11 @@ For every team, expected_total = earned + expected_remaining, where
 The same payout engine is also used by the waiver/trade optimizers. Those
 optimizers build hypothetical weekly score projections for one or more teams,
 then call `expected_money_from_context()` without re-simulating the other teams.
+For a team's OWN unmodified roster, `baseline_sim_from_context()` lets those
+same callers reuse this context's already-computed weekly_means instead of
+re-running the lineup optimizer a second time for a roster that's already been
+simulated once (build_expected_money_context() simulates every team via
+simulate_all_teams() to build the context in the first place).
 
 Where the numbers come from:
   * Placement: win_probability.league_distribution gives each team's chance
@@ -44,6 +49,12 @@ import simulator
 import win_probability as wp
 
 PLACE_KEYS = {1: "first", 2: "second", 3: "third"}
+
+# Weekly-high winner detection compares floats that have round-tripped
+# through JSON/SQLite (actual scores from ESPN/Sleeper, or computed means) -
+# exact `==` is fragile for a genuine tie, so ties are detected within this
+# tolerance instead.
+_TIE_EPS = 1e-6
 
 
 def payout_settings(league_key: str) -> dict:
@@ -102,7 +113,11 @@ def _high_scorers(scores: dict) -> list:
     if not scores:
         return []
     top = max(scores.values())
-    return [tid for tid, s in scores.items() if s == top]
+    # abs(...) <= _TIE_EPS rather than == top: scores here can be either
+    # actual final scores (floats from the platform APIs) or computed means,
+    # and exact float equality misses genuine ties that differ only by
+    # floating-point noise.
+    return [tid for tid, s in scores.items() if abs(s - top) <= _TIE_EPS]
 
 
 def build_expected_money_context(
@@ -161,6 +176,44 @@ def build_expected_money_context(
     }
 
 
+def baseline_sim_from_context(context: dict, team_id, start_week: int, end_week: int) -> dict:
+    """
+    A simulate_roster()-shaped result for a team's CURRENT, unmodified
+    roster, built from weekly_means an expected-money context already holds
+    - instead of re-running the lineup optimizer for a roster that's already
+    been simulated once (build_expected_money_context() simulates every team
+    via simulate_all_teams() to build the context in the first place).
+
+    Callers in waiver.py/trades.py that already hold a money_context for a
+    team's baseline (as opposed to a hypothetical modified roster, which
+    still needs a real simulate_roster() call - the context has no way to
+    know about those) should use this instead of re-simulating.
+
+    IMPORTANT: context["weekly_means"] spans week 1 through the league's end
+    week regardless of what window the caller cares about (it comes from
+    simulate_all_teams(conn, league_key, 1, ps["end_week"], ...) inside
+    build_expected_money_context), so this filters down to exactly
+    [start_week, end_week] to match what simulate_roster(conn, ...,
+    start_week, end_week) would have totaled. Passing the wrong window here
+    would silently produce a baseline total that includes weeks the caller
+    never asked about.
+
+    Money mode never applies decay (every waiver.py/trades.py caller sets
+    sim_decay=None whenever objective=="money"), so weighted_total ==
+    raw_total here, matching what simulate_roster(..., decay=None) returns.
+    """
+    full_weekly = context["weekly_means"][team_id]
+    weekly = {w: (full_weekly.get(w, 0.0) or 0.0) for w in range(start_week, end_week + 1)}
+    raw_total = sum(weekly.values())
+    return {
+        "weekly": weekly,
+        "weights": {w: 1.0 for w in weekly},
+        "raw_total": raw_total,
+        "weighted_total": raw_total,
+        "total": raw_total,
+    }
+
+
 def _evaluate_expected_money(
     context: dict,
     weekly_overrides: Optional[dict] = None,
@@ -210,6 +263,15 @@ def _evaluate_expected_money(
     if weekly:
         n_weekly_weeks = weekly["end_week"] - weekly["start_week"] + 1
 
+        # NOTE: every team_id is considered for every weekly-high week here,
+        # including a team that's actually on a bye in a given regular-season
+        # week or already eliminated from the playoffs. That's a deliberate,
+        # documented simplifying assumption (see the module docstring above),
+        # not an oversight - `schedule` only carries REGULAR-SEASON matchups
+        # (see db.py's replace_schedule comment), so a playoff week has no
+        # entries there at all, and restricting eligibility to "teams present
+        # in `schedule` this week" would wrongly zero out every team's
+        # weekly-high odds during the playoffs, not just the ones on a bye.
         for week in range(weekly["start_week"], weekly["end_week"] + 1):
             if week in completed:
                 weeks_paid += 1

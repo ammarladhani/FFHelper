@@ -31,6 +31,14 @@ Both entry points also take an optional `progress_callback(current, total,
 message=None)` - the web UI's jobs.Job.report is passed in here to drive
 a live progress bar; it's a no-op by default (None), so nothing here
 changes for existing CLI callers or the test suite, which never pass it.
+
+In money mode, a team's CURRENT (unmodified) roster is never re-simulated
+here - `payouts.build_expected_money_context()` has already simulated every
+team's current roster once to build the money context, so the baseline for
+whichever team is running the search is reconstructed from that context via
+`payouts.baseline_sim_from_context()` instead of paying for the lineup
+optimizer a second time. Only HYPOTHETICAL (post add/drop) rosters still go
+through `simulate_roster()`, since the context has no way to know about those.
 """
 
 import logging
@@ -102,17 +110,25 @@ def _search_pickups(
     )
     sim_decay = None if objective == "money" else decay
 
-    baseline_sim = simulate_roster(
-        conn,
-        league_key,
-        current_ids,
-        slot_counts,
-        start_week,
-        sim_end_week,
-        player_info_cache,
-        projection_cache,
-        decay=sim_decay,
-    )
+    if objective == "money":
+        # The current roster's baseline has already been simulated once by
+        # build_expected_money_context() (via simulate_all_teams) - reuse
+        # that instead of running the optimizer again for the same roster.
+        baseline_sim = payouts.baseline_sim_from_context(
+            money_context, team_id, start_week, sim_end_week
+        )
+    else:
+        baseline_sim = simulate_roster(
+            conn,
+            league_key,
+            current_ids,
+            slot_counts,
+            start_week,
+            sim_end_week,
+            player_info_cache,
+            projection_cache,
+            decay=sim_decay,
+        )
     baseline_points = baseline_sim["total"]
     baseline_raw = baseline_sim["raw_total"]
 
@@ -358,17 +374,24 @@ def plan_waiver_moves(
     player_info_cache: dict = {}
     projection_cache: dict = {}
 
-    starting_sim = simulate_roster(
-        conn,
-        league_key,
-        current_ids,
-        slot_counts,
-        start_week,
-        sim_end_week,
-        player_info_cache,
-        projection_cache,
-        decay=None if objective == "money" else decay,
-    )
+    if objective == "money":
+        # Already simulated once inside build_expected_money_context() -
+        # reconstruct rather than re-running the optimizer.
+        starting_sim = payouts.baseline_sim_from_context(
+            money_context, team_id, start_week, sim_end_week
+        )
+    else:
+        starting_sim = simulate_roster(
+            conn,
+            league_key,
+            current_ids,
+            slot_counts,
+            start_week,
+            sim_end_week,
+            player_info_cache,
+            projection_cache,
+            decay=decay,
+        )
     starting_projected_total = starting_sim["total"]
     starting_raw_total = starting_sim["raw_total"]
 
@@ -559,15 +582,21 @@ def explain_pickup(
         sim_end_week = money_context["playoff_settings"]["end_week"]
         sim_decay = None
 
-    before = simulate_roster(
-        conn,
-        league_key,
-        current_ids,
-        slot_counts,
-        start_week,
-        sim_end_week,
-        decay=sim_decay,
-    )
+    if objective == "money":
+        # Already simulated once inside build_expected_money_context().
+        before = payouts.baseline_sim_from_context(
+            money_context, team_id, start_week, sim_end_week
+        )
+    else:
+        before = simulate_roster(
+            conn,
+            league_key,
+            current_ids,
+            slot_counts,
+            start_week,
+            sim_end_week,
+            decay=sim_decay,
+        )
 
     new_ids = [pid for pid in current_ids if pid != drop_player_id] + [add_player_id]
     after = simulate_roster(

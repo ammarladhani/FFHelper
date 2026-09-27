@@ -17,11 +17,24 @@ this is what actually shrinks the combinatorics now) and
 must contain at least one of these players, on either side). Both default
 to empty, which is the same as "consider every tradeable player."
 
-Every entry point takes an optional `decay` (None = off). When given,
-the win-win test and the sort order both use recency-weighted totals (see
+Every entry point takes an optional `decay` (None = off). When given, the
+win-win test and the sort order both use recency-weighted totals (see
 weighting.py) - near-term weeks count for more. Returned `delta` numbers
 are in that same weighted metric; the `raw_*` twins are the plain,
 unweighted point changes.
+
+Search sizing: `suggest_trades` defaults to 1-for-1 swaps only
+(`combo_sizes=(1,)`), matching the README; pass `combo_sizes=(1, 2)`
+explicitly for 2-for-1/2-for-2 too - it searches far more combinations and
+is much slower, especially with a large candidate pool.
+
+In money mode, a team's CURRENT (unmodified) roster is never re-simulated
+here - `payouts.build_expected_money_context()` has already simulated every
+team's current roster once to build the money context, so each baseline is
+reconstructed from that context via `payouts.baseline_sim_from_context()`
+instead of paying for the lineup optimizer a second time. Only HYPOTHETICAL
+(post-trade) rosters still go through `simulate_roster()`, since the context
+has no way to know about those.
 """
 
 from itertools import combinations
@@ -32,6 +45,9 @@ from typing import Optional
 import repo
 import payouts
 from simulator import simulate_roster
+
+DEFAULT_COMBO_SIZES = (1,)
+
 
 def _reject_reserved(conn, league_key, team_id, player_ids, as_of_week):
     reserved = repo.get_reserved_player_ids(conn, league_key, team_id, as_of_week)
@@ -77,12 +93,21 @@ def evaluate_trade(
     a_ids = repo.get_roster_player_ids(conn, league_key, team_a_id, as_of_week)
     b_ids = repo.get_roster_player_ids(conn, league_key, team_b_id, as_of_week)
 
-    baseline_a = simulate_roster(
-        conn, league_key, a_ids, slot_counts, start_week, sim_end_week, decay=sim_decay
-    )
-    baseline_b = simulate_roster(
-        conn, league_key, b_ids, slot_counts, start_week, sim_end_week, decay=sim_decay
-    )
+    if objective == "money":
+        # Already simulated once inside build_expected_money_context().
+        baseline_a = payouts.baseline_sim_from_context(
+            money_context, team_a_id, start_week, sim_end_week
+        )
+        baseline_b = payouts.baseline_sim_from_context(
+            money_context, team_b_id, start_week, sim_end_week
+        )
+    else:
+        baseline_a = simulate_roster(
+            conn, league_key, a_ids, slot_counts, start_week, sim_end_week, decay=sim_decay
+        )
+        baseline_b = simulate_roster(
+            conn, league_key, b_ids, slot_counts, start_week, sim_end_week, decay=sim_decay
+        )
 
     new_a_ids = [pid for pid in a_ids if pid not in team_a_gives] + team_b_gives
     new_b_ids = [pid for pid in b_ids if pid not in team_b_gives] + team_a_gives
@@ -191,13 +216,6 @@ def evaluate_trade(
     }
 
 
-# 2-for-1 / 2-for-2 is combinatorially much more expensive (see the
-# excluded_player_ids note above) - default to 1-for-1 only, same as the
-# README documents. Pass combo_sizes=(1, 2) explicitly if you want the
-# wider (slower) search.
-DEFAULT_COMBO_SIZES = (1, 2)
-
-
 def suggest_trades(
     conn,
     league_key: str,
@@ -273,17 +291,23 @@ def suggest_trades(
         if str(pid) not in excluded_player_ids
     ]
 
-    my_baseline_sim = simulate_roster(
-        conn,
-        league_key,
-        my_ids_full,
-        slot_counts,
-        start_week,
-        sim_end_week,
-        player_info_cache,
-        projection_cache,
-        decay=sim_decay,
-    )
+    if objective == "money":
+        # Already simulated once inside build_expected_money_context().
+        my_baseline_sim = payouts.baseline_sim_from_context(
+            money_context, my_team_id, start_week, sim_end_week
+        )
+    else:
+        my_baseline_sim = simulate_roster(
+            conn,
+            league_key,
+            my_ids_full,
+            slot_counts,
+            start_week,
+            sim_end_week,
+            player_info_cache,
+            projection_cache,
+            decay=sim_decay,
+        )
     my_baseline = my_baseline_sim["total"]
     my_baseline_raw = my_baseline_sim["raw_total"]
 
@@ -311,17 +335,23 @@ def suggest_trades(
             if str(pid) not in excluded_player_ids
         ]
 
-        other_baseline_sim = simulate_roster(
-            conn,
-            league_key,
-            other_ids_full,
-            slot_counts,
-            start_week,
-            sim_end_week,
-            player_info_cache,
-            projection_cache,
-            decay=sim_decay,
-        )
+        if objective == "money":
+            # Already simulated once inside build_expected_money_context().
+            other_baseline_sim = payouts.baseline_sim_from_context(
+                money_context, other_id, start_week, sim_end_week
+            )
+        else:
+            other_baseline_sim = simulate_roster(
+                conn,
+                league_key,
+                other_ids_full,
+                slot_counts,
+                start_week,
+                sim_end_week,
+                player_info_cache,
+                projection_cache,
+                decay=sim_decay,
+            )
         other_money_before = None
         if objective == "money":
             other_money_before = baseline_money_by_team[other_id]["expected_total"]
@@ -622,12 +652,21 @@ def explain_trade(
     a_ids = repo.get_roster_player_ids(conn, league_key, team_a_id, as_of_week)
     b_ids = repo.get_roster_player_ids(conn, league_key, team_b_id, as_of_week)
 
-    before_a = simulate_roster(
-        conn, league_key, a_ids, slot_counts, start_week, sim_end_week, decay=sim_decay
-    )
-    before_b = simulate_roster(
-        conn, league_key, b_ids, slot_counts, start_week, sim_end_week, decay=sim_decay
-    )
+    if objective == "money":
+        # Already simulated once inside build_expected_money_context().
+        before_a = payouts.baseline_sim_from_context(
+            money_context, team_a_id, start_week, sim_end_week
+        )
+        before_b = payouts.baseline_sim_from_context(
+            money_context, team_b_id, start_week, sim_end_week
+        )
+    else:
+        before_a = simulate_roster(
+            conn, league_key, a_ids, slot_counts, start_week, sim_end_week, decay=sim_decay
+        )
+        before_b = simulate_roster(
+            conn, league_key, b_ids, slot_counts, start_week, sim_end_week, decay=sim_decay
+        )
 
     new_a_ids = [pid for pid in a_ids if pid not in team_a_gives] + team_b_gives
     new_b_ids = [pid for pid in b_ids if pid not in team_b_gives] + team_a_gives

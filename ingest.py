@@ -191,7 +191,18 @@ def ingest_sleeper_weeks_parallel(conn, league_cfg, league_key, season, start_we
                     position = player.get("position") or (fantasy_positions[0] if fantasy_positions else None)
 
                     eligible_slots = list(fantasy_positions) + ["BN"]
-                    if has_ir_slot:
+                    # Only mark a player IR-eligible if THIS player is actually
+                    # sitting in IR right now (per reserved_map, built above from
+                    # each roster's own "reserve" list). `has_ir_slot` alone just
+                    # means the LEAGUE has an IR slot type - it says nothing
+                    # about any individual player's injury/roster status, which
+                    # isn't otherwise tracked here. Appending "IR" to every
+                    # player's eligible_slots regardless of reserved_map made
+                    # that field claim eligibility it hadn't earned; harmless
+                    # for scoring today only because IR sits in
+                    # config.NON_STARTING_SLOTS (same 0-cost as bench), but it's
+                    # wrong data for anything that later checks real eligibility.
+                    if has_ir_slot and reserved_map.get(raw_id) == "IR":
                         eligible_slots.append("IR")
 
                     projected = stats.get(points_field)
