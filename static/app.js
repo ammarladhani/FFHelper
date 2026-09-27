@@ -190,7 +190,9 @@ async function initSidebar() {
     state.teamId = Number(e.target.value);
     $("team-name-label").textContent = teamLabel(state.teamId);
     refreshTradePartnerOptions();
+    resetTradePickers();
     if (activeView === "evaluate") loadEvaluateTeamOptions();
+    if (activeView === "trades") { loadTradeGiveRoster(); loadTradeGetRoster(); }
   });
 
   $("start-week").addEventListener("change", (e) => { state.startWeek = Number(e.target.value) || 1; });
@@ -273,6 +275,7 @@ async function loadLeague(leagueKey) {
   updateDecayHint();
 
   clearResultsOnLeagueSwitch();
+  resetTradePickers();
   refreshOddsDefaults();
   refreshTradePartnerOptions();
   onViewEnter(activeView);
@@ -375,6 +378,11 @@ function switchView(key) {
 function onViewEnter(key) {
   if (key === "rosters") loadRosterTeamOptions();
   if (key === "evaluate") loadEvaluateTeamOptions();
+  if (key === "trades") {
+    resetTradePickers();
+    loadTradeGiveRoster();
+    loadTradeGetRoster();
+  }
 }
 
 /* ==========================================================================
@@ -730,13 +738,10 @@ function initWaiverView() {
   body.innerHTML = `
     <div class="card">
       <div class="card-header"><h3>Find pickups</h3></div>
-      <div class="card-grid">
+      <div class="view-desc">Always searched per-position, so a deep position like WR can't flood a shallow one (QB/TE/K) out of the search.</div>
+      <div class="card-grid" style="margin-top:10px">
         <div class="field-group"><label class="field-label">How many to show</label><input type="range" id="w-topn" min="5" max="50" value="15" /><div class="field-hint" id="w-topn-label"></div></div>
-        <div class="field-group">
-          <div class="checkbox-row"><input type="checkbox" id="w-bypos" /><label for="w-bypos">Search per-position (so a deep position like WR can't flood out QB/TE/K)</label></div>
-        </div>
-        <div class="field-group" id="w-fa-global"><label class="field-label">Free agents considered</label><input type="range" id="w-fa" min="10" max="100" value="40" /><div class="field-hint" id="w-fa-label"></div></div>
-        <div class="field-group" id="w-fa-perpos" style="display:none"><label class="field-label">Free agents per position</label><input type="range" id="w-fa-pp" min="5" max="30" value="10" /><div class="field-hint" id="w-fa-pp-label"></div></div>
+        <div class="field-group"><label class="field-label">Free agents per position</label><input type="range" id="w-fa-pp" min="5" max="30" value="10" /><div class="field-hint" id="w-fa-pp-label"></div></div>
       </div>
       <div style="margin-top:14px"><button class="btn btn-primary" id="w-find-btn">Find pickups</button></div>
       <div id="w-progress" style="margin-top:12px"></div>
@@ -753,16 +758,10 @@ function initWaiverView() {
 
   const syncLabels = () => {
     $("w-topn-label").textContent = `${$("w-topn").value} pickups`;
-    $("w-fa-label").textContent = `${$("w-fa").value} free agents`;
     $("w-fa-pp-label").textContent = `${$("w-fa-pp").value} per position`;
   };
-  ["w-topn", "w-fa", "w-fa-pp"].forEach((id) => $(id).addEventListener("input", syncLabels));
+  ["w-topn", "w-fa-pp"].forEach((id) => $(id).addEventListener("input", syncLabels));
   syncLabels();
-
-  $("w-bypos").addEventListener("change", (e) => {
-    $("w-fa-global").style.display = e.target.checked ? "none" : "block";
-    $("w-fa-perpos").style.display = e.target.checked ? "block" : "none";
-  });
 
   $("w-find-btn").addEventListener("click", runWaiverPickups);
   $("w-plan-btn").addEventListener("click", runWaiverPlan);
@@ -772,12 +771,11 @@ async function runWaiverPickups() {
   const btn = $("w-find-btn"), prog = $("w-progress"), results = $("w-results");
   btn.disabled = true;
   results.innerHTML = "";
-  const byPos = $("w-bypos").checked;
   try {
     const { job_id } = await API.post(`/api/leagues/${state.league}/waiver/pickups`, {
       team_id: state.teamId, start_week: state.startWeek, end_week: state.endWeek,
-      top_n: Number($("w-topn").value), by_position: byPos,
-      fa_prefilter: Number($("w-fa").value), fa_per_position: Number($("w-fa-pp").value),
+      top_n: Number($("w-topn").value),
+      fa_per_position: Number($("w-fa-pp").value),
       decay: decayOrNull(),
       objective: objective(),
     });
@@ -852,11 +850,10 @@ async function runWaiverPlan() {
   const btn = $("w-plan-btn"), prog = $("w-plan-progress"), results = $("w-plan-results");
   btn.disabled = true;
   results.innerHTML = "";
-  const byPos = $("w-bypos").checked;
   try {
     const { job_id } = await API.post(`/api/leagues/${state.league}/waiver/plan`, {
       team_id: state.teamId, start_week: state.startWeek, end_week: state.endWeek,
-      by_position: byPos, fa_prefilter: Number($("w-fa").value), fa_per_position: Number($("w-fa-pp").value),
+      fa_per_position: Number($("w-fa-pp").value),
       decay: decayOrNull(),
       objective: objective(),
     });
@@ -943,13 +940,99 @@ function renderWaiverPlan(plan) {
    VIEW: Trade Finder
    ========================================================================== */
 
+// Player state maps, keyed by player_id: value is "include" or "exclude".
+// A missing entry means "none" (default). These reset whenever the trades
+// view is (re)entered or the league changes - nothing here persists.
+let tradeGiveStates = new Map();
+let tradeGetStates = new Map();
+let tradeGivePlayers = [];
+let tradeGetPlayers = [];
+let allTradeProposals = [];
+
+function resetTradePickers() {
+  tradeGiveStates = new Map();
+  tradeGetStates = new Map();
+  tradeGivePlayers = [];
+  tradeGetPlayers = [];
+  allTradeProposals = [];
+}
+
+function cycleTradeState(current) {
+  if (current === undefined || current === "none") return "include";
+  if (current === "include") return "exclude";
+  return "none";
+}
+
+function tradeStatePillClass(s) {
+  if (s === "include") return "positive";
+  if (s === "exclude") return "negative";
+  return "neutral";
+}
+
+function tradeStatePillLabel(s) {
+  if (s === "include") return "Included";
+  if (s === "exclude") return "Excluded";
+  return "None";
+}
+
+function tradePlayerRowHTML(p, stateMap) {
+  const s = stateMap.get(p.player_id) || "none";
+  return `
+    <div class="player-select-row" data-pid="${esc(p.player_id)}">
+      <span>${esc(p.name)}</span>
+      <span class="pos">${esc(p.position || "")}</span>
+      <button type="button" class="pill ${tradeStatePillClass(s)}" data-toggle-pid="${esc(p.player_id)}"
+              style="border:none;cursor:pointer;margin-left:auto">${tradeStatePillLabel(s)}</button>
+    </div>`;
+}
+
+function tradePositionButtonsHTML(players, side) {
+  const positions = Array.from(
+    new Set(players.map((p) => p.position).filter(Boolean))
+  ).sort();
+
+  if (!positions.length) return "";
+
+  return positions.map((pos) => `
+    <span style="display:inline-flex;gap:4px;align-items:center">
+      <span class="field-hint" style="margin-right:2px">${esc(pos)}</span>
+
+      <button
+        type="button"
+        class="btn btn-sm btn-ghost"
+        data-bulk-pos-action="include"
+        data-bulk-pos="${esc(pos)}"
+        data-bulk-side="${side}">
+        Include
+      </button>
+
+      <button
+        type="button"
+        class="btn btn-sm btn-ghost"
+        data-bulk-pos-action="exclude"
+        data-bulk-pos="${esc(pos)}"
+        data-bulk-side="${side}">
+        Exclude
+      </button>
+
+      <button
+        type="button"
+        class="btn btn-sm btn-ghost"
+        data-bulk-pos-action="none"
+        data-bulk-pos="${esc(pos)}"
+        data-bulk-side="${side}">
+        Clear
+      </button>
+    </span>
+  `).join("");
+}
+
 function initTradesView() {
   const body = $("trades-body");
   body.innerHTML = `
     <div class="card">
       <div class="card-grid">
         <div class="field-group"><label class="field-label">Trade partner</label><select id="t-partner"></select></div>
-        <div class="field-group"><label class="field-label">Search depth (prefilter)</label><input type="range" id="t-prefilter" min="4" max="25" value="12" /><div class="field-hint" id="t-prefilter-label"></div></div>
         <div class="field-group"><label class="field-label">Show top N</label><input type="range" id="t-topn" min="5" max="100" value="10" /><div class="field-hint" id="t-topn-label"></div></div>
         <div class="field-group">
           <label class="field-label">Trade size</label>
@@ -958,22 +1041,34 @@ function initTradesView() {
             <label class="checkbox-row"><input type="checkbox" id="t-size-2" /> 2-for-2</label>
             <label class="checkbox-row"><input type="checkbox" id="t-size-3" /> 3-for-3</label>
           </div>
-          <div class="field-hint">2-for-2 / 3-for-3 search far more combinations — much slower, especially at a high prefilter.</div>
+          <div class="field-hint">2-for-2 / 3-for-3 search far more combinations — much slower with a lot of players still in play.</div>
         </div>
       </div>
-      <div style="margin-top:14px"><button class="btn btn-primary" id="t-find-btn">Find trades</button></div>
-      <div id="t-progress" style="margin-top:12px"></div>
     </div>
+    <div class="card">
+      <div class="card-header"><h3>Your players</h3><span class="card-sub">tap a pill to cycle: none → include → exclude</span></div>
+      <div class="controls-row" id="t-give-positions" style="margin-bottom:10px"></div>
+      <div class="player-select-box" id="t-give-players"></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h3>Their players</h3><span class="card-sub" id="t-get-hint"></span></div>
+      <div class="controls-row" id="t-get-positions" style="margin-bottom:10px"></div>
+      <div class="player-select-box" id="t-get-players"></div>
+    </div>
+    <div style="margin-top:14px"><button class="btn btn-primary" id="t-find-btn">Find trades</button></div>
+    <div id="t-progress" style="margin-top:12px"></div>
     <div id="t-results"></div>`;
 
   const sync = () => {
-    $("t-prefilter-label").textContent = `${$("t-prefilter").value} candidates/side`;
     $("t-topn-label").textContent = `top ${$("t-topn").value}`;
     if (allTradeProposals.length) renderTradeResultsList(allTradeProposals);
   };
-  ["t-prefilter", "t-topn"].forEach((id) => $(id).addEventListener("input", sync));
+  $("t-topn").addEventListener("input", sync);
   sync();
+
+  $("t-partner").addEventListener("change", () => { loadTradeGetRoster(); });
   $("t-find-btn").addEventListener("click", runTradeFinder);
+  wireTradePlayerPickers();
 }
 
 function refreshTradePartnerOptions() {
@@ -982,10 +1077,204 @@ function refreshTradePartnerOptions() {
   sel.innerHTML = `<option value="">Any team</option>` + others.map((t) => `<option value="${t.team_id}">${esc(t.team_name)}</option>`).join("");
 }
 
-let allTradeProposals = [];
-let tradeExcludeGivePositions = new Set();
-let tradeExcludeGetPositions = new Set();
-let tradeExcludePlayers = new Set();
+function applyTradePositionBulk(players, stateMap, position, action) {
+  const next =
+    action === "include" || action === "exclude"
+      ? action
+      : "none";
+
+  players
+    .filter((p) => p.position === position)
+    .forEach((p) => {
+      if (next === "none") {
+        stateMap.delete(p.player_id);
+      } else {
+        stateMap.set(p.player_id, next);
+      }
+    });
+}
+
+function wireTradePlayerPickers() {
+  $("t-give-players").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-toggle-pid]");
+    if (!btn) return;
+    const pid = btn.dataset.togglePid;
+    const cur = tradeGiveStates.get(pid) || "none";
+    const next = cycleTradeState(cur);
+    if (next === "none") tradeGiveStates.delete(pid); else tradeGiveStates.set(pid, next);
+    renderGiveBox();
+  });
+  $("t-get-players").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-toggle-pid]");
+    if (!btn) return;
+    const pid = btn.dataset.togglePid;
+    const cur = tradeGetStates.get(pid) || "none";
+    const next = cycleTradeState(cur);
+    if (next === "none") tradeGetStates.delete(pid); else tradeGetStates.set(pid, next);
+    renderGetBox();
+  });
+  document.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-bulk-pos-action]");
+  if (!btn) return;
+
+  const action = btn.dataset.bulkPosAction;
+  const position = btn.dataset.bulkPos;
+  const side = btn.dataset.bulkSide;
+
+  if (side === "give") {
+    applyTradePositionBulk(
+      tradeGivePlayers,
+      tradeGiveStates,
+      position,
+      action
+    );
+    renderGiveBox();
+  } else if (side === "get") {
+    const partner = $("t-partner")?.value || "";
+
+    const players = partner
+      ? tradeGetPlayers.filter(
+          (p) => String(p.team_id) === String(partner)
+        )
+      : tradeGetPlayers;
+
+    applyTradePositionBulk(
+      players,
+      tradeGetStates,
+      position,
+      action
+    );
+
+    renderGetBox();
+  }
+});
+}
+
+async function loadTradeGiveRoster() {
+  if (!state.league || !state.teamId) return;
+  const data = await API.get(`/api/leagues/${state.league}/roster`, { team_id: state.teamId, week: state.startWeek });
+  tradeGivePlayers = data.players.filter((p) => !p.reserved);
+  renderGiveBox();
+}
+
+async function loadTradeGetRoster() {
+  if (!state.league || !state.teamId) return;
+
+  const opponents = state.teams.filter(
+    (t) => t.team_id !== state.teamId
+  );
+
+  try {
+    const rows = await Promise.all(
+      opponents.map(async (team) => {
+        const data = await API.get(
+          `/api/leagues/${state.league}/roster`,
+          {
+            team_id: team.team_id,
+            week: state.startWeek,
+          }
+        );
+
+        return data.players
+          .filter((p) => !p.reserved)
+          .map((p) => ({
+            ...p,
+            team_id: team.team_id,
+            team_name: team.team_name,
+          }));
+      })
+    );
+
+    tradeGetPlayers = rows.flat();
+  } catch (e) {
+    tradeGetPlayers = [];
+
+    const box = $("t-get-players");
+    if (box) {
+      box.innerHTML = errorBanner(e.message);
+    }
+
+    return;
+  }
+
+  renderGetBox();
+}
+
+function renderGiveBox() {
+  const box = $("t-give-players");
+  if (!box) return;
+  box.innerHTML = tradeGivePlayers.length
+    ? tradeGivePlayers.map((p) => tradePlayerRowHTML(p, tradeGiveStates)).join("")
+    : emptyState("📭", "No tradeable players.");
+  $("t-give-positions").innerHTML = tradePositionButtonsHTML(tradeGivePlayers, "give");
+}
+
+function renderGetBox() {
+  const box = $("t-get-players");
+  if (!box) return;
+
+  const partner = $("t-partner")?.value || "";
+
+  const players = partner
+    ? tradeGetPlayers.filter(
+        (p) => String(p.team_id) === String(partner)
+      )
+    : tradeGetPlayers;
+
+  if (!players.length) {
+    box.innerHTML = `
+      <div class="field-hint">
+        ${
+          partner
+            ? "No tradeable players found for this team."
+            : "No opposing players found."
+        }
+      </div>
+    `;
+    return;
+  }
+
+  const grouped = new Map();
+
+  players.forEach((p) => {
+    const key = p.team_id;
+
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        team_name: p.team_name || `Team ${p.team_id}`,
+        players: [],
+      });
+    }
+
+    grouped.get(key).players.push(p);
+  });
+
+  box.innerHTML = `
+    <div class="field-hint">
+      ${
+        partner
+          ? "Showing players from the selected trade partner."
+          : "All opposing players are shown. Player filters apply across all teams."
+      }
+    </div>
+
+    <div class="trade-position-buttons" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+      ${tradePositionButtonsHTML(players, "get")}
+    </div>
+
+    ${Array.from(grouped.values()).map((group) => `
+      <div class="trade-team-group">
+        <div class="trade-team-name">
+          ${esc(group.team_name)}
+        </div>
+
+        ${group.players.map((p) =>
+          tradePlayerRowHTML(p, tradeGetStates)
+        ).join("")}
+      </div>
+    `).join("")}
+  `;
+}
 
 async function runTradeFinder() {
   const btn = $("t-find-btn"), prog = $("t-progress"), results = $("t-results");
@@ -994,20 +1283,28 @@ async function runTradeFinder() {
   btn.disabled = true;
   results.innerHTML = "";
   const partner = $("t-partner").value;
+
+  const excludedIds = [
+    ...Array.from(tradeGiveStates.entries()).filter(([, s]) => s === "exclude").map(([pid]) => pid),
+    ...Array.from(tradeGetStates.entries()).filter(([, s]) => s === "exclude").map(([pid]) => pid),
+  ];
+  const includedIds = [
+    ...Array.from(tradeGiveStates.entries()).filter(([, s]) => s === "include").map(([pid]) => pid),
+    ...Array.from(tradeGetStates.entries()).filter(([, s]) => s === "include").map(([pid]) => pid),
+  ];
+
   try {
     const { job_id } = await API.post(`/api/leagues/${state.league}/trades/suggest`, {
       team_id: state.teamId, start_week: state.startWeek, end_week: state.endWeek,
-      candidate_prefilter: Number($("t-prefilter").value),
       partner_team_id: partner ? Number(partner) : null, combo_sizes: sizes, decay: decayOrNull(),
-       objective: objective(),
+      objective: objective(),
+      excluded_player_ids: excludedIds,
+      included_player_ids: includedIds,
     });
     const result = await pollJob(job_id, (j) => { prog.innerHTML = progressHTML(j, "Searching trade combinations..."); });
     prog.innerHTML = "";
     state.lastRunScope.trades = scopeKey(partner || "any");
     allTradeProposals = result.proposals;
-    tradeExcludeGivePositions = new Set();
-    tradeExcludeGetPositions = new Set();
-    tradeExcludePlayers = new Set();
     renderTradeFinder(allTradeProposals);
   } catch (e) {
     prog.innerHTML = "";
@@ -1019,111 +1316,16 @@ async function runTradeFinder() {
 
 function renderTradeFinder(all) {
   const results = $("t-results");
-  if (!all.length) { results.innerHTML = emptyState("🤷", "No win-win trades found with the current search depth."); return; }
-
-  const givePositions = new Set(), getPositions = new Set();
-  const playersById = new Map();
-  all.forEach((p) => {
-    p.give.forEach((x) => { if (x.position) givePositions.add(x.position); playersById.set(x.player_id, x.name); });
-    p.get.forEach((x) => { if (x.position) getPositions.add(x.position); playersById.set(x.player_id, x.name); });
-  });
-  const giveArr = Array.from(givePositions).sort();
-  const getArr = Array.from(getPositions).sort();
-  const playerArr = Array.from(playersById.entries()).sort((a, b) => a[1].localeCompare(b[1]));
-
-  const posBoxHTML = (id, arr) => arr.length
-    ? arr.map((pos) => `<label class="player-select-row"><input type="checkbox" data-pos="${esc(pos)}" /><span>${esc(pos)}</span></label>`).join("")
-    : `<div class="player-select-row"><span>—</span></div>`;
-
-  results.innerHTML = `
-    ${staleBanner("trades", $("t-partner").value || "any")}
-    <div class="card">
-      <div class="card-header"><h3>Filter results</h3><button class="btn btn-ghost btn-sm" id="t-filter-clear">Clear filters</button></div>
-      <div class="card-grid">
-        <div class="field-group">
-          <label class="field-label">Exclude positions you'd give</label>
-          <div class="player-select-box" id="t-filter-give-positions">${posBoxHTML("give", giveArr)}</div>
-        </div>
-        <div class="field-group">
-          <label class="field-label">Exclude positions you'd get</label>
-          <div class="player-select-box" id="t-filter-get-positions">${posBoxHTML("get", getArr)}</div>
-        </div>
-        <div class="field-group">
-          <label class="field-label">Exclude players (either side)</label>
-          <input type="text" id="t-filter-player-search" placeholder="Search players..." />
-          <div class="player-select-box" id="t-filter-players">
-            ${playerArr.map(([id, name]) => `<label class="player-select-row"><input type="checkbox" data-pid="${esc(id)}" /><span>${esc(name)}</span></label>`).join("")}
-          </div>
-        </div>
-      </div>
-    </div>
-    <div id="t-results-list"></div>`;
-
-  wireTradeFilterEvents();
+  if (!all.length) { results.innerHTML = emptyState("🤷", "No win-win trades found with the current player filters."); return; }
+  results.innerHTML = `${staleBanner("trades", $("t-partner").value || "any")}<div id="t-results-list"></div>`;
   renderTradeResultsList(all);
-}
-
-function applyTradeFilters(all) {
-  if (!tradeExcludeGivePositions.size && !tradeExcludeGetPositions.size && !tradeExcludePlayers.size) return all;
-  return all.filter((p) => {
-    if (p.give.some((x) => x.position && tradeExcludeGivePositions.has(x.position))) return false;
-    if (p.get.some((x) => x.position && tradeExcludeGetPositions.has(x.position))) return false;
-    if ([...p.give, ...p.get].some((x) => tradeExcludePlayers.has(x.player_id))) return false;
-    return true;
-  });
-}
-
-function wireTradeFilterEvents() {
-  document.querySelectorAll("#t-filter-give-positions input[type=checkbox]").forEach((cb) => {
-    cb.addEventListener("change", () => {
-      if (cb.checked) tradeExcludeGivePositions.add(cb.dataset.pos); else tradeExcludeGivePositions.delete(cb.dataset.pos);
-      renderTradeResultsList(allTradeProposals);
-    });
-  });
-  document.querySelectorAll("#t-filter-get-positions input[type=checkbox]").forEach((cb) => {
-    cb.addEventListener("change", () => {
-      if (cb.checked) tradeExcludeGetPositions.add(cb.dataset.pos); else tradeExcludeGetPositions.delete(cb.dataset.pos);
-      renderTradeResultsList(allTradeProposals);
-    });
-  });
-  document.querySelectorAll("#t-filter-players input[type=checkbox]").forEach((cb) => {
-    cb.addEventListener("change", () => {
-      if (cb.checked) tradeExcludePlayers.add(cb.dataset.pid); else tradeExcludePlayers.delete(cb.dataset.pid);
-      renderTradeResultsList(allTradeProposals);
-    });
-  });
-  const search = $("t-filter-player-search");
-  if (search) search.addEventListener("input", (e) => {
-    const q = e.target.value.toLowerCase();
-    document.querySelectorAll("#t-filter-players .player-select-row").forEach((row) => {
-      const name = row.querySelector("span:last-child").textContent.toLowerCase();
-      row.style.display = name.includes(q) ? "" : "none";
-    });
-  });
-  const clearBtn = $("t-filter-clear");
-  if (clearBtn) clearBtn.addEventListener("click", () => {
-    tradeExcludeGivePositions = new Set();
-    tradeExcludeGetPositions = new Set();
-    tradeExcludePlayers = new Set();
-    document.querySelectorAll("#t-filter-give-positions input, #t-filter-get-positions input, #t-filter-players input")
-      .forEach((cb) => { cb.checked = false; });
-    renderTradeResultsList(allTradeProposals);
-  });
 }
 
 function renderTradeResultsList(all) {
   const container = $("t-results-list");
   if (!container) return;
-  const filtered = applyTradeFilters(all);
   const topN = Number($("t-topn").value);
-  const shown = filtered.slice(0, topN);
-  const anyFilter = tradeExcludeGivePositions.size || tradeExcludeGetPositions.size || tradeExcludePlayers.size;
-  const filterNote = anyFilter ? ` &middot; ${all.length - filtered.length} hidden by filters` : "";
-
-  if (!filtered.length) {
-    container.innerHTML = `<div class="card">${emptyState("🚫", "No trades left after filtering — try clearing a filter.")}</div>`;
-    return;
-  }
+  const shown = all.slice(0, topN);
 
   const cards = shown.map((p) => `
     <div class="proposal-card">
@@ -1145,7 +1347,7 @@ function renderTradeResultsList(all) {
     </div>`).join("");
 
   const giveCounts = {}, getCounts = {};
-  filtered.forEach((p) => {
+  all.forEach((p) => {
     p.give.forEach((x) => { giveCounts[x.name] = (giveCounts[x.name] || 0) + 1; });
     p.get.forEach((x) => { getCounts[x.name] = (getCounts[x.name] || 0) + 1; });
   });
@@ -1153,7 +1355,7 @@ function renderTradeResultsList(all) {
   const giveTop = topEntries(giveCounts, 10), getTop = topEntries(getCounts, 10);
 
   container.innerHTML = `
-    <div class="card"><div class="card-header"><h3>Showing ${shown.length} of ${filtered.length} win-win trades${filterNote}</h3></div>
+    <div class="card"><div class="card-header"><h3>Showing ${shown.length} of ${all.length} win-win trades</h3></div>
       <div class="list-stack">${cards}</div>
     </div>
     <div class="two-col">

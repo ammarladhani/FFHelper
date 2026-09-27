@@ -282,8 +282,6 @@ class WaiverPickupsRequest(BaseModel):
     end_week: int
     as_of_week: Optional[int] = None
     top_n: int = 15
-    by_position: bool = False
-    fa_prefilter: int = waiver.DEFAULT_FA_PREFILTER
     fa_per_position: int = waiver.DEFAULT_FA_PER_POSITION
     decay: Optional[float] = None
     objective: str = "points"
@@ -301,8 +299,8 @@ def waiver_pickups_start(league: str, req: WaiverPickupsRequest):
             )
         picks = waiver.best_pickups(
             conn, league, req.team_id, req.start_week, req.end_week,
-            as_of_week=req.as_of_week, top_n=req.top_n, by_position=req.by_position,
-            fa_prefilter=req.fa_prefilter, fa_per_position=req.fa_per_position,
+            as_of_week=req.as_of_week, top_n=req.top_n,
+            fa_per_position=req.fa_per_position,
             decay=_effective_decay(objective, req.decay),
             objective=objective,
             progress_callback=lambda *a, **kw: job.report(*a, **kw),
@@ -317,8 +315,6 @@ class WaiverPlanRequest(BaseModel):
     start_week: int
     end_week: int
     as_of_week: Optional[int] = None
-    by_position: bool = False
-    fa_prefilter: int = waiver.DEFAULT_FA_PREFILTER
     fa_per_position: int = waiver.DEFAULT_FA_PER_POSITION
     max_moves: int = 50
     decay: Optional[float] = None
@@ -337,8 +333,8 @@ def waiver_plan_start(league: str, req: WaiverPlanRequest):
             )
         plan = waiver.plan_waiver_moves(
             conn, league, req.team_id, req.start_week, req.end_week,
-            as_of_week=req.as_of_week, by_position=req.by_position, fa_prefilter=req.fa_prefilter,
-            fa_per_position=req.fa_per_position, max_moves=req.max_moves,
+            as_of_week=req.as_of_week, fa_per_position=req.fa_per_position,
+            max_moves=req.max_moves,
             decay=_effective_decay(objective, req.decay),
             objective=objective,
             progress_callback=lambda *a, **kw: job.report(*a, **kw),
@@ -377,11 +373,12 @@ class TradeSuggestRequest(BaseModel):
     start_week: int
     end_week: int
     as_of_week: Optional[int] = None
-    candidate_prefilter: int = 12
     partner_team_id: Optional[int] = None
     combo_sizes: List[int] = [1]
     decay: Optional[float] = None
     objective: str = "points"
+    excluded_player_ids: List[str] = []
+    included_player_ids: List[str] = []
 
 
 @app.post("/api/leagues/{league}/trades/suggest")
@@ -396,10 +393,12 @@ def trade_suggest_start(league: str, req: TradeSuggestRequest):
             )
         proposals = trades.suggest_trades(
             conn, league, req.team_id, req.start_week, req.end_week, as_of_week=req.as_of_week,
-            candidate_prefilter=req.candidate_prefilter, partner_team_id=req.partner_team_id,
+            partner_team_id=req.partner_team_id,
             combo_sizes=tuple(sorted(set(req.combo_sizes))) or (1,),
             decay=_effective_decay(objective, req.decay),
             objective=objective,
+            excluded_player_ids=set(req.excluded_player_ids),
+            included_player_ids=set(req.included_player_ids),
             progress_callback=lambda *a, **kw: job.report(*a, **kw),
         )
         job.set_result({"proposals": proposals})
@@ -464,31 +463,70 @@ def trade_explain(league: str, req: TradeEvaluateRequest):
 @app.get("/api/leagues/{league}/roster")
 def roster(league: str, team_id: Optional[int] = None, week: int = 1,
            end_week: Optional[int] = None, decay: Optional[float] = None):
-    """team_id omitted/None means free agents, matching repo's own
-    team_id IS NULL convention."""
+    """Return a team's roster or free agents.
+
+    This endpoint uses a request-local SQLite connection because the frontend
+    can request multiple opposing rosters concurrently. The global connection
+    is still used by the single-request/background-job endpoints.
+    """
     _league_cfg(league)
-    if team_id is None:
-        player_ids = repo.get_free_agent_ids(conn, league, week)
-    else:
-        player_ids = repo.get_roster_player_ids(conn, league, team_id, week)
 
-    players = repo.get_roster_with_projection(conn, league, player_ids, week)
-    reserved = repo.get_reserved_player_ids(conn, league, team_id, week) if team_id is not None else set()
-    end = end_week or league_info.league_end_week(league)
-    totals = repo.get_projection_totals(conn, league, [p["player_id"] for p in players], week, end, decay)
+    roster_conn = db.get_conn(config.DB_PATH)
+    try:
+        if team_id is None:
+            player_ids = repo.get_free_agent_ids(roster_conn, league, week)
+        else:
+            player_ids = repo.get_roster_player_ids(
+                roster_conn, league, team_id, week
+            )
 
-    rows = []
-    for p in players:
-        t = totals.get(p["player_id"], {"raw": 0.0, "weighted": 0.0})
-        rows.append({
-            **p,
-            "reserved": p["player_id"] in reserved,
-            "rest_of_season_raw": round(t["raw"], 1),
-            "rest_of_season_weighted": round(t["weighted"], 1),
-        })
-    rows.sort(key=lambda r: r["rest_of_season_weighted" if decay is not None else "rest_of_season_raw"],
-              reverse=True)
-    return {"players": rows, "week": week, "end_week": end}
+        players = repo.get_roster_with_projection(
+            roster_conn, league, player_ids, week
+        )
+
+        reserved = (
+            repo.get_reserved_player_ids(
+                roster_conn, league, team_id, week
+            )
+            if team_id is not None
+            else set()
+        )
+
+        end = end_week or league_info.league_end_week(league)
+        totals = repo.get_projection_totals(
+            roster_conn,
+            league,
+            [p["player_id"] for p in players],
+            week,
+            end,
+            decay,
+        )
+
+        rows = []
+        for p in players:
+            t = totals.get(
+                p["player_id"],
+                {"raw": 0.0, "weighted": 0.0},
+            )
+            rows.append({
+                **p,
+                "reserved": p["player_id"] in reserved,
+                "rest_of_season_raw": round(t["raw"], 1),
+                "rest_of_season_weighted": round(t["weighted"], 1),
+            })
+
+        rows.sort(
+            key=lambda r: (
+                r["rest_of_season_weighted"]
+                if decay is not None
+                else r["rest_of_season_raw"]
+            ),
+            reverse=True,
+        )
+
+        return {"players": rows, "week": week, "end_week": end}
+    finally:
+        roster_conn.close()
 
 
 class MovePlayerRequest(BaseModel):

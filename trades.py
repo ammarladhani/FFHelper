@@ -4,18 +4,24 @@ Trade engine with two entry points:
 - evaluate_trade: given an explicit trade (players each side gives up),
   compute the before/after remaining-season projected total for both
   teams.
-- suggest_trades: search 1-for-1 (and optionally 2-for-1/2-for-2)
-  swaps between your team and every other team, keeping only trades
-  where BOTH sides' projected totals improve.
+- suggest_trades: search 1-for-1 (and optionally 2-for-1/2-for-2) swaps
+  between your team and every other team, keeping only trades where BOTH
+  sides' projected totals improve.
 
-The search is capped to a prefiltered subset of each roster to keep
-the combinatorics sane - see `candidate_prefilter`.
+Candidate pools are no longer ranking-based (there used to be a
+`candidate_prefilter` that kept only the top-N players by rest-of-season
+projection on each side). Instead, the caller passes explicit
+`excluded_player_ids` (players who must never appear in a proposed trade -
+this is what actually shrinks the combinatorics now) and
+`included_player_ids` (if this set is non-empty, every returned proposal
+must contain at least one of these players, on either side). Both default
+to empty, which is the same as "consider every tradeable player."
 
 Every entry point takes an optional `decay` (None = off). When given,
-the candidate prefilter, the win-win test, and the sort order all use
-recency-weighted totals (see weighting.py) - near-term weeks count for
-more. Returned `delta` numbers are in that same weighted metric; the
-`raw_*` twins are the plain, unweighted point changes.
+the win-win test and the sort order both use recency-weighted totals (see
+weighting.py) - near-term weeks count for more. Returned `delta` numbers
+are in that same weighted metric; the `raw_*` twins are the plain,
+unweighted point changes.
 """
 
 from itertools import combinations
@@ -186,9 +192,9 @@ def evaluate_trade(
 
 
 # 2-for-1 / 2-for-2 is combinatorially much more expensive (see the
-# candidate_prefilter note below) - default to 1-for-1 only, same as
-# the README documents. Pass combo_sizes=(1, 2) explicitly, with a
-# smaller candidate_prefilter, if you want the wider (slower) search.
+# excluded_player_ids note above) - default to 1-for-1 only, same as the
+# README documents. Pass combo_sizes=(1, 2) explicitly if you want the
+# wider (slower) search.
 DEFAULT_COMBO_SIZES = (1, 2)
 
 
@@ -199,15 +205,27 @@ def suggest_trades(
     start_week: int,
     end_week: int,
     as_of_week: int = None,
-    candidate_prefilter: int = 12,
     combo_sizes=DEFAULT_COMBO_SIZES,
     partner_team_id: int = None,
     progress_callback=None,
     decay: Optional[float] = None,
     objective: str = "points",
+    excluded_player_ids: Optional[set] = None,
+    included_player_ids: Optional[set] = None,
 ) -> list:
     """
     Search win-win 1-for-1 (and optionally larger) trades.
+
+    `excluded_player_ids`: players (yours or any opponent's) that are
+    never considered as part of a trade - removed from the candidate pool
+    on whichever side they belong to before any combinations are built.
+    This is what keeps the search tractable now that there's no top-N
+    ranking prefilter.
+
+    `included_player_ids`: if non-empty, only proposals that contain at
+    least one of these players (give side OR get side) are returned. This
+    is checked before the (expensive) roster simulation for each combo, so
+    it also cuts down the work done, not just what gets shown.
 
     `objective="points"` preserves the existing behavior.
 
@@ -219,6 +237,11 @@ def suggest_trades(
     objective = (objective or "points").lower()
     if objective not in {"points", "money"}:
         raise ValueError("objective must be 'points' or 'money'")
+
+    # Normalize IDs because the frontend sends JSON strings while SQLite
+    # / repo data may expose IDs using another scalar type.
+    excluded_player_ids = {str(pid) for pid in (excluded_player_ids or ())}
+    included_player_ids = {str(pid) for pid in (included_player_ids or ())}
 
     slot_counts = repo.get_slot_counts(conn, league_key)
 
@@ -245,15 +268,10 @@ def suggest_trades(
     my_reserved = repo.get_reserved_player_ids(conn, league_key, my_team_id, as_of_week)
     my_tradeable_ids = [pid for pid in my_ids_full if pid not in my_reserved]
 
-    my_candidates = _top_players_by_rest_of_season(
-        conn,
-        league_key,
-        my_tradeable_ids,
-        start_week,
-        end_week,
-        candidate_prefilter,
-        sim_decay,
-    )
+    my_candidates = [
+        pid for pid in my_tradeable_ids
+        if str(pid) not in excluded_player_ids
+    ]
 
     my_baseline_sim = simulate_roster(
         conn,
@@ -288,15 +306,10 @@ def suggest_trades(
         other_reserved = repo.get_reserved_player_ids(conn, league_key, other_id, as_of_week)
         other_tradeable_ids = [pid for pid in other_ids_full if pid not in other_reserved]
 
-        other_candidates = _top_players_by_rest_of_season(
-            conn,
-            league_key,
-            other_tradeable_ids,
-            start_week,
-            end_week,
-            candidate_prefilter,
-            sim_decay,
-        )
+        other_candidates = [
+            pid for pid in other_tradeable_ids
+            if str(pid) not in excluded_player_ids
+        ]
 
         other_baseline_sim = simulate_roster(
             conn,
@@ -320,10 +333,49 @@ def suggest_trades(
             other_money_before,
         )
 
+        my_included = {
+            pid for pid in my_candidates
+            if str(pid) in included_player_ids
+        }
+        other_included = {
+            pid for pid in other_candidates
+            if str(pid) in included_player_ids
+        }
+
         for size in combo_sizes:
-            if len(my_candidates) >= size and len(other_candidates) >= size:
+            if len(my_candidates) < size or len(other_candidates) < size:
+                continue
+
+            if not included_player_ids:
                 total_combos += comb(len(my_candidates), size) * comb(
                     len(other_candidates), size
+                )
+            else:
+                # Count only combinations that can actually satisfy the
+                # "at least one included player" requirement. This makes the
+                # progress total reflect the real search space too.
+                my_inc_count = (
+                    comb(len(my_candidates), size)
+                    - comb(len(my_candidates) - len(my_included), size)
+                    if len(my_candidates) - len(my_included) >= size
+                    else comb(len(my_candidates), size)
+                )
+                my_noninc_count = (
+                    comb(len(my_candidates) - len(my_included), size)
+                    if len(my_candidates) - len(my_included) >= size
+                    else 0
+                )
+                other_inc_count = (
+                    comb(len(other_candidates), size)
+                    - comb(len(other_candidates) - len(other_included), size)
+                    if len(other_candidates) - len(other_included) >= size
+                    else comb(len(other_candidates), size)
+                )
+                other_nonrestricted_count = comb(len(other_candidates), size)
+
+                total_combos += (
+                    my_inc_count * other_nonrestricted_count
+                    + my_noninc_count * other_inc_count
                 )
 
     update_every = max(1, total_combos // 150)
@@ -351,13 +403,43 @@ def suggest_trades(
         other_baseline_raw = other_baseline_sim["raw_total"]
 
         for size in combo_sizes:
-            for my_combo in combinations(my_candidates, size):
-                new_a_ids = [pid for pid in my_ids_full if pid not in my_combo]
+            if len(my_candidates) < size or len(other_candidates) < size:
+                continue
 
-                for other_combo in combinations(other_candidates, size):
+            if included_player_ids:
+                my_inc_set = {
+                    pid for pid in my_candidates
+                    if str(pid) in included_player_ids
+                }
+                other_inc_set = {
+                    pid for pid in other_candidates
+                    if str(pid) in included_player_ids
+                }
+
+                all_my_combos = list(combinations(my_candidates, size))
+                my_inc_combos = [c for c in all_my_combos if my_inc_set.intersection(c)]
+                my_noninc_combos = [c for c in all_my_combos if not my_inc_set.intersection(c)]
+
+                all_other_combos = list(combinations(other_candidates, size))
+                other_inc_combos = [c for c in all_other_combos if other_inc_set.intersection(c)]
+
+                combo_pairs = (
+                    ((my_combo, other_combo) for my_combo in my_inc_combos for other_combo in all_other_combos),
+                    ((my_combo, other_combo) for my_combo in my_noninc_combos for other_combo in other_inc_combos),
+                )
+            else:
+                combo_pairs = (
+                    ((my_combo, other_combo)
+                     for my_combo in combinations(my_candidates, size)
+                     for other_combo in combinations(other_candidates, size)),
+                )
+
+            for pair_group in combo_pairs:
+                for my_combo, other_combo in pair_group:
                     considered += 1
                     _report()
 
+                    new_a_ids = [pid for pid in my_ids_full if pid not in my_combo]
                     trial_a_ids = new_a_ids + list(other_combo)
                     new_a_sim = simulate_roster(
                         conn,
@@ -483,7 +565,12 @@ def suggest_trades(
 def _top_players_by_rest_of_season(conn, league_key, player_ids, start_week, end_week, limit,
                                     decay: Optional[float] = None):
     """Rank player_ids by rest-of-season projection - recency-weighted
-    if `decay` is given, plain sum otherwise - and keep the top `limit`."""
+    if `decay` is given, plain sum otherwise - and keep the top `limit`.
+
+    No longer used by suggest_trades (candidate pools there are now just
+    "everything not excluded"), but kept around as a general-purpose
+    ranking helper.
+    """
     if not player_ids:
         return []
     totals = repo.get_projection_totals(conn, league_key, player_ids, start_week, end_week, decay)

@@ -12,12 +12,13 @@ Two entry points:
   move gains anything. Answers "after I make that first move, what's
   the NEXT best thing to do?" instead of just the first move alone.
 
-To keep the search tractable, free agents are pre-filtered before the
-expensive lineup-optimizer-based delta calculation on each candidate -
-either to the top `fa_prefilter` overall, or (with by_position=True)
-to the top `fa_per_position` at EACH position separately, so a deep
-position (WR) can't flood a shallow one (QB/TE/K/...) out of the search
-entirely.
+Free agents are always pre-filtered PER POSITION before the expensive
+lineup-optimizer-based delta calculation on each candidate - top
+`fa_per_position` at EACH position separately, so a deep position (WR)
+can't flood a shallow one (QB/TE/K/...) out of the search entirely.
+There used to also be a single global top-N cutoff across every
+position combined (`fa_prefilter`/`by_position=False`); that mode is
+gone - per-position is always on now.
 
 Every entry point takes an optional `decay` (None = off). When given,
 both the free-agent prefilter ranking AND the add/drop gain that results
@@ -38,33 +39,21 @@ from typing import Callable, Optional
 
 import repo
 import payouts
-from simulator import simulate_roster
 
 logger = logging.getLogger(__name__)
 
-# Matches the README: the whole point of this prefilter is to avoid
-# running the lineup optimizer against every free agent in the league.
-# This had drifted to 2533 in a previous commit, which for most leagues
-# is "every free agent" - i.e. the prefilter was doing nothing and
-# waiver searches were taking O(free agents x roster size) full-season
-# simulations. Raise it explicitly per-call if you want a wider search.
-DEFAULT_FA_PREFILTER = 40
-
-# Default when by_position=True - top N free agents AT EACH position,
-# rather than DEFAULT_FA_PREFILTER total across all positions combined.
+# Top N free agents AT EACH position considered before the expensive
+# per-candidate simulation runs.
 DEFAULT_FA_PER_POSITION = 10
 
 
 def _get_fa_pool(conn, league_key: str, as_of_week: int, start_week: int, end_week: int,
-                  fa_prefilter: int, by_position: bool, fa_per_position: int,
-                  decay: Optional[float] = None) -> list:
-    if by_position:
-        return repo.get_free_agents_ranked_by_position(
-            conn, league_key, as_of_week, start_week, end_week,
-            limit_per_position=fa_per_position, decay=decay,
-        )
-    return repo.get_free_agents_ranked(
-        conn, league_key, as_of_week, start_week, end_week, limit=fa_prefilter, decay=decay,
+                  fa_per_position: int, decay: Optional[float] = None) -> list:
+    """Free agent pool, always ranked and pre-filtered separately PER
+    POSITION (top `fa_per_position` at each position)."""
+    return repo.get_free_agents_ranked_by_position(
+        conn, league_key, as_of_week, start_week, end_week,
+        limit_per_position=fa_per_position, decay=decay,
     )
 
 
@@ -99,6 +88,7 @@ def _search_pickups(
     The point metrics are still returned in money mode so the UI can show
     the old point impact alongside the new objective.
     """
+    from simulator import simulate_roster
     objective = (objective or "points").lower()
     if objective not in {"points", "money"}:
         raise ValueError("objective must be 'points' or 'money'")
@@ -243,8 +233,6 @@ def best_pickups(
     end_week: int,
     as_of_week: int = None,
     top_n: int = 10,
-    fa_prefilter: int = DEFAULT_FA_PREFILTER,
-    by_position: bool = False,
     fa_per_position: int = DEFAULT_FA_PER_POSITION,
     decay: Optional[float] = None,
     objective: str = "points",
@@ -280,8 +268,6 @@ def best_pickups(
         as_of_week,
         start_week,
         end_week,
-        fa_prefilter,
-        by_position,
         fa_per_position,
         pool_decay,
     )
@@ -323,8 +309,6 @@ def plan_waiver_moves(
     start_week: int,
     end_week: int,
     as_of_week: int = None,
-    fa_prefilter: int = DEFAULT_FA_PREFILTER,
-    by_position: bool = False,
     fa_per_position: int = DEFAULT_FA_PER_POSITION,
     max_moves: int = 50,
     decay: Optional[float] = None,
@@ -340,6 +324,7 @@ def plan_waiver_moves(
     gain. End-of-season placement money is included automatically, as are
     all configured future weekly-high prizes.
     """
+    from simulator import simulate_roster
     as_of_week = as_of_week or start_week
     objective = (objective or "points").lower()
     if objective not in {"points", "money"}:
@@ -366,8 +351,6 @@ def plan_waiver_moves(
         as_of_week,
         start_week,
         end_week,
-        fa_prefilter,
-        by_position,
         fa_per_position,
         pool_decay,
     )
@@ -547,6 +530,7 @@ def explain_pickup(
     In money mode, the response also includes the before/after expected
     prize-money totals and their delta.
     """
+    from simulator import simulate_roster
     as_of_week = as_of_week or start_week
     objective = (objective or "points").lower()
     if objective not in {"points", "money"}:
