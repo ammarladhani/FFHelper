@@ -425,7 +425,7 @@ class TradeSuggestRequest(BaseModel):
 
 @app.post("/api/leagues/{league}/trades/suggest")
 def trade_suggest_start(league: str, req: TradeSuggestRequest):
-    cfg = _league_cfg(league)  # validated on the request thread - see waiver_pickups_start
+    cfg = _league_cfg(league)
 
     def _run(job: jobs.Job):
         objective = _optimizer_objective(req.objective)
@@ -439,6 +439,7 @@ def trade_suggest_start(league: str, req: TradeSuggestRequest):
                 objective=objective,
                 excluded_player_ids=set(req.excluded_player_ids),
                 included_player_ids=set(req.included_player_ids),
+                db_path=config.DB_PATH,
                 progress_callback=lambda *a, **kw: job.report(*a, **kw),
             )
         job.set_result({"proposals": proposals})

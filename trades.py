@@ -45,17 +45,24 @@ progress bar), and `_evaluate_trade_candidate` (simulate and score one
 candidate swap) rather than living as one long nested function.
 """
 
+import concurrent.futures
+import os
 from itertools import combinations
 from math import comb
 import math
 from typing import Optional
 
+import db
 import objectives
 import repo
 import payouts
 from simulator import simulate_roster
 
 DEFAULT_COMBO_SIZES = (1,)
+
+# Below this many total candidate pairs, process-pool startup overhead
+# isn't worth it - the default 1-for-1 search usually lands here.
+PARALLEL_MIN_COMBOS = 200
 
 
 def _reject_reserved(conn, league_key, team_id, player_ids, as_of_week):
@@ -263,6 +270,42 @@ def _count_combo_universe(my_candidates: list, other_candidates: list, combo_siz
         total += my_inc_count * other_nonrestricted_count + my_noninc_count * other_inc_count
     return total
 
+def _generate_combo_pairs(my_candidates: list, other_candidates: list, combo_sizes,
+                          included_player_ids: set):
+    """
+    Yields every (my_combo, other_combo) tuple to evaluate for one partner
+    team. Factored out of suggest_trades so the sequential path and the
+    multiprocess path search the identical candidate set in the identical
+    order - this is pure refactoring, not a behavior change: the logic here
+    is copied verbatim from what suggest_trades's search loop used to build
+    inline via `combo_pairs`.
+    """
+    for size in combo_sizes:
+        if len(my_candidates) < size or len(other_candidates) < size:
+            continue
+
+        if included_player_ids:
+            my_inc_set = {pid for pid in my_candidates if str(pid) in included_player_ids}
+            other_inc_set = {pid for pid in other_candidates if str(pid) in included_player_ids}
+
+            all_my_combos = list(combinations(my_candidates, size))
+            my_inc_combos = [c for c in all_my_combos if my_inc_set.intersection(c)]
+            my_noninc_combos = [c for c in all_my_combos if not my_inc_set.intersection(c)]
+
+            all_other_combos = list(combinations(other_candidates, size))
+            other_inc_combos = [c for c in all_other_combos if other_inc_set.intersection(c)]
+
+            for my_combo in my_inc_combos:
+                for other_combo in all_other_combos:
+                    yield my_combo, other_combo
+            for my_combo in my_noninc_combos:
+                for other_combo in other_inc_combos:
+                    yield my_combo, other_combo
+        else:
+            for my_combo in combinations(my_candidates, size):
+                for other_combo in combinations(other_candidates, size):
+                    yield my_combo, other_combo
+
 
 def _evaluate_trade_candidate(
     conn,
@@ -363,6 +406,53 @@ def _evaluate_trade_candidate(
         "partner_money_delta": round(money_partner_delta, 2) if objective == "money" else None,
     }
 
+# ---------------------------------------------------------- multiprocess search
+#
+# Each worker process gets its OWN sqlite connection (opened once, in
+# _worker_init, on that process) and its OWN player_info/projection caches -
+# mirroring the "one connection per thread/task" rule the rest of this
+# codebase follows (see server.py's get_conn docstring), just at the
+# process level instead of the request level. Nothing about the actual
+# trade evaluation logic changes: _evaluate_candidate_chunk calls the exact
+# same _evaluate_trade_candidate every candidate has always gone through.
+
+_worker_conn = None
+_worker_player_info_cache: dict = {}
+_worker_projection_cache: dict = {}
+
+
+def _worker_init(db_path: str):
+    global _worker_conn, _worker_player_info_cache, _worker_projection_cache
+    _worker_conn = db.get_conn(db_path)
+    _worker_player_info_cache = {}
+    _worker_projection_cache = {}
+
+
+def _evaluate_candidate_chunk(chunk: list, common_by_partner: dict) -> list:
+    """
+    Runs in a worker process. `chunk` is a list of (other_id, my_combo,
+    other_combo) tuples, possibly spanning several partner teams for
+    better load balancing; `common_by_partner[other_id]` holds every
+    argument _evaluate_trade_candidate needs that's constant across all of
+    that partner's candidates.
+    """
+    global _worker_conn, _worker_player_info_cache, _worker_projection_cache
+    proposals = []
+    for other_id, my_combo, other_combo in chunk:
+        c = common_by_partner[other_id]
+        proposal = _evaluate_trade_candidate(
+            _worker_conn,
+            c["league_key"], c["my_team_id"], c["my_ids_full"], my_combo,
+            other_id, c["other_ids_full"], other_combo, c["partner_team_name"],
+            c["slot_counts"], c["start_week"], c["sim_end_week"],
+            _worker_player_info_cache, _worker_projection_cache,
+            c["sim_decay"], c["objective"], c["money_context"],
+            c["my_baseline"], c["my_baseline_raw"], c["my_money_before"],
+            c["other_baseline"], c["other_baseline_raw"], c["other_money_before"],
+        )
+        if proposal is not None:
+            proposals.append(proposal)
+    return proposals
 
 def suggest_trades(
     conn,
@@ -378,6 +468,9 @@ def suggest_trades(
     objective: str = "points",
     excluded_player_ids: Optional[set] = None,
     included_player_ids: Optional[set] = None,
+    db_path: Optional[str] = None,
+    max_workers: Optional[int] = None,
+    parallel: bool = True,
 ) -> list:
     """
     Search win-win 1-for-1 (and optionally larger) trades.
@@ -398,6 +491,16 @@ def suggest_trades(
     `objective="money"` keeps only trades where both teams' expected prize
     money increases. Weekly high-score prizes and end-of-season placement
     prizes are both included.
+    
+    `db_path`: when given (and not ":memory:"), and the search is big enough
+    to be worth it (see PARALLEL_MIN_COMBOS), the candidate search runs
+    across a process pool instead of one process - every candidate is
+    still evaluated through the exact same _evaluate_trade_candidate, so
+    results are identical, just faster. Omit this (the default) to keep
+    the old single-process behavior - this is what the test suite's
+    in-memory sqlite connections need, since a :memory: database can't be
+    reopened by a worker process. `max_workers` defaults to os.cpu_count().
+    `parallel=False` forces single-process even when db_path is given.
     """
     as_of_week = as_of_week or start_week
     objective = objectives.normalize_objective(objective)
@@ -481,7 +584,7 @@ def suggest_trades(
             my_candidates, other_candidates, combo_sizes, my_included, other_included, included_player_ids,
         )
 
-    update_every = max(1, total_combos // 150)
+        update_every = max(1, total_combos // 150)
     considered = 0
 
     def _report(force=False):
@@ -490,63 +593,150 @@ def suggest_trades(
 
     proposals = []
 
-    for team in teams:
-        other_id = team["team_id"]
-        if other_id == my_team_id:
-            continue
+    use_parallel = (
+        parallel
+        and db_path is not None
+        and db_path != ":memory:"
+        and total_combos >= PARALLEL_MIN_COMBOS
+    )
 
-        other_ids_full, other_candidates, other_baseline_sim, other_money_before = team_data[other_id]
-        other_baseline = other_baseline_sim["total"]
-        other_baseline_raw = other_baseline_sim["raw_total"]
+    if use_parallel:
+        workers = max_workers or os.cpu_count() or 4
 
-        for size in combo_sizes:
-            if len(my_candidates) < size or len(other_candidates) < size:
+        common_by_partner = {}
+        flat_pairs = []  # (other_id, my_combo, other_combo)
+
+        for team in teams:
+            other_id = team["team_id"]
+            if other_id == my_team_id:
+                continue
+            other_ids_full, other_candidates, other_baseline_sim, other_money_before = team_data[other_id]
+
+            common_by_partner[other_id] = {
+                "league_key": league_key,
+                "my_team_id": my_team_id,
+                "my_ids_full": my_ids_full,
+                "other_ids_full": other_ids_full,
+                "partner_team_name": team["team_name"],
+                "slot_counts": slot_counts,
+                "start_week": start_week,
+                "sim_end_week": sim_end_week,
+                "sim_decay": sim_decay,
+                "objective": objective,
+                "money_context": money_context,
+                "my_baseline": my_baseline,
+                "my_baseline_raw": my_baseline_raw,
+                "my_money_before": my_money_before,
+                "other_baseline": other_baseline_sim["total"],
+                "other_baseline_raw": other_baseline_sim["raw_total"],
+                "other_money_before": other_money_before,
+            }
+
+            for my_combo, other_combo in _generate_combo_pairs(
+                my_candidates, other_candidates, combo_sizes, included_player_ids,
+            ):
+                flat_pairs.append((other_id, my_combo, other_combo))
+
+        # ~8 chunks per worker: enough to balance load across partners of
+        # very different candidate-pool sizes, not so many that per-task
+        # overhead (pickling common_by_partner, IPC) starts to matter.
+        chunk_size = max(20, len(flat_pairs) // max(1, workers * 8))
+        chunks = [flat_pairs[i:i + chunk_size] for i in range(0, len(flat_pairs), chunk_size)]
+
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers, initializer=_worker_init, initargs=(db_path,),
+        ) as executor:
+            future_to_len = {
+                executor.submit(_evaluate_candidate_chunk, chunk, common_by_partner): len(chunk)
+                for chunk in chunks
+            }
+            for future in concurrent.futures.as_completed(future_to_len):
+                proposals.extend(future.result())
+                considered += future_to_len[future]
+                if progress_callback:
+                    progress_callback(considered, total_combos)
+
+    else:
+        for team in teams:
+            other_id = team["team_id"]
+            if other_id == my_team_id:
                 continue
 
-            if included_player_ids:
-                my_inc_set = {pid for pid in my_candidates if str(pid) in included_player_ids}
-                other_inc_set = {pid for pid in other_candidates if str(pid) in included_player_ids}
+            other_ids_full, other_candidates, other_baseline_sim, other_money_before = team_data[other_id]
+            other_baseline = other_baseline_sim["total"]
+            other_baseline_raw = other_baseline_sim["raw_total"]
 
-                all_my_combos = list(combinations(my_candidates, size))
-                my_inc_combos = [c for c in all_my_combos if my_inc_set.intersection(c)]
-                my_noninc_combos = [c for c in all_my_combos if not my_inc_set.intersection(c)]
+            for my_combo, other_combo in _generate_combo_pairs(
+                my_candidates, other_candidates, combo_sizes, included_player_ids,
+            ):
+                considered += 1
+                _report()
 
-                all_other_combos = list(combinations(other_candidates, size))
-                other_inc_combos = [c for c in all_other_combos if other_inc_set.intersection(c)]
-
-                combo_pairs = (
-                    ((my_combo, other_combo) for my_combo in my_inc_combos for other_combo in all_other_combos),
-                    ((my_combo, other_combo) for my_combo in my_noninc_combos for other_combo in other_inc_combos),
+                proposal = _evaluate_trade_candidate(
+                    conn, league_key, my_team_id, my_ids_full, my_combo,
+                    other_id, other_ids_full, other_combo, team["team_name"],
+                    slot_counts, start_week, sim_end_week, player_info_cache, projection_cache,
+                    sim_decay, objective, money_context,
+                    my_baseline, my_baseline_raw, my_money_before,
+                    other_baseline, other_baseline_raw, other_money_before,
                 )
-            else:
-                combo_pairs = (
-                    ((my_combo, other_combo)
-                     for my_combo in combinations(my_candidates, size)
-                     for other_combo in combinations(other_candidates, size)),
-                )
+                if proposal is not None:
+                    proposals.append(proposal)
 
-            for pair_group in combo_pairs:
-                for my_combo, other_combo in pair_group:
-                    considered += 1
-                    _report()
-
-                    proposal = _evaluate_trade_candidate(
-                        conn, league_key, my_team_id, my_ids_full, my_combo,
-                        other_id, other_ids_full, other_combo, team["team_name"],
-                        slot_counts, start_week, sim_end_week, player_info_cache, projection_cache,
-                        sim_decay, objective, money_context,
-                        my_baseline, my_baseline_raw, my_money_before,
-                        other_baseline, other_baseline_raw, other_money_before,
-                    )
-                    if proposal is not None:
-                        proposals.append(proposal)
-
-    _report(force=True)
+        _report(force=True)
 
     proposals.sort(
         key=lambda p: math.sqrt(p["my_delta"] * p["partner_delta"]),
         reverse=True,
     )
+    return proposals
+
+# ---------------------------------------------------------- multiprocess search
+#
+# Each worker process gets its OWN sqlite connection (opened once, in
+# _worker_init, on that process) and its OWN player_info/projection caches -
+# mirroring the "one connection per thread/task" rule the rest of this
+# codebase follows (see server.py's get_conn docstring), just at the
+# process level instead of the request level. Nothing about the actual
+# trade evaluation logic changes: _evaluate_candidate_chunk calls the exact
+# same _evaluate_trade_candidate every candidate has always gone through.
+
+_worker_conn = None
+_worker_player_info_cache: dict = {}
+_worker_projection_cache: dict = {}
+
+
+def _worker_init(db_path: str):
+    global _worker_conn, _worker_player_info_cache, _worker_projection_cache
+    _worker_conn = db.get_conn(db_path)
+    _worker_player_info_cache = {}
+    _worker_projection_cache = {}
+
+
+def _evaluate_candidate_chunk(chunk: list, common_by_partner: dict) -> list:
+    """
+    Runs in a worker process. `chunk` is a list of (other_id, my_combo,
+    other_combo) tuples, possibly spanning several partner teams for
+    better load balancing; `common_by_partner[other_id]` holds every
+    argument _evaluate_trade_candidate needs that's constant across all of
+    that partner's candidates.
+    """
+    global _worker_conn, _worker_player_info_cache, _worker_projection_cache
+    proposals = []
+    for other_id, my_combo, other_combo in chunk:
+        c = common_by_partner[other_id]
+        proposal = _evaluate_trade_candidate(
+            _worker_conn,
+            c["league_key"], c["my_team_id"], c["my_ids_full"], my_combo,
+            other_id, c["other_ids_full"], other_combo, c["partner_team_name"],
+            c["slot_counts"], c["start_week"], c["sim_end_week"],
+            _worker_player_info_cache, _worker_projection_cache,
+            c["sim_decay"], c["objective"], c["money_context"],
+            c["my_baseline"], c["my_baseline_raw"], c["my_money_before"],
+            c["other_baseline"], c["other_baseline_raw"], c["other_money_before"],
+        )
+        if proposal is not None:
+            proposals.append(proposal)
     return proposals
 
 

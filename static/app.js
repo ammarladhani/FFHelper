@@ -86,6 +86,99 @@ function progressHTML(job, label) {
     </div>`;
 }
 
+/* Text export (for sharing trades) ---------------------------------------- */
+
+function playerLabel(p) {
+  return p.position ? `${p.name} (${p.position})` : p.name;
+}
+
+function signedMoney(n) {
+  return `${n >= 0 ? "+" : "−"}$${Math.abs(n).toFixed(2)}`;
+}
+
+function impactText(delta, isMoney) {
+  return isMoney ? signedMoney(delta) : `${signed1(delta)} pts`;
+}
+
+function partnerName(p) {
+  const partner = state.teams.find((t) => t.team_id === p.partner_team_id);
+  return partner && partner.manager_name ? partner.manager_name : p.partner_team_name;
+}
+
+// One compact table row per trade. Points mode uses the raw (unweighted)
+// change so the numbers make sense outside this tool.
+function tradeRow(p) {
+  const isMoney = p.objective === "money";
+  return {
+    partner: partnerName(p),
+    give: p.give.map(playerLabel).join(" + "),
+    get: p.get.map(playerLabel).join(" + "),
+    you: impactText(isMoney ? p.partner_delta : p.partner_raw_delta, isMoney),
+    me: impactText(isMoney ? p.my_delta : p.my_raw_delta, isMoney),
+    isMoney,
+  };
+}
+
+// Monospace table wrapped in a code fence so chat apps keep the alignment.
+function rowsToTable(rows) {
+  const isMoney = rows[0].isMoney;
+  const showPartner = new Set(rows.map((r) => r.partner)).size > 1;
+  const cols = [
+    ...(showPartner ? [["Partner", "partner"]] : []),
+    ["I send", "give"], ["You send", "get"], ["You", "you"], ["Me", "me"],
+  ];
+  const cells = rows.map((r, i) => [String(i + 1), ...cols.map(([, k]) => r[k])]);
+  const heads = ["#", ...cols.map(([h]) => h)];
+  const widths = heads.map((h, c) => Math.max(h.length, ...cells.map((r) => r[c].length)));
+  const line = (arr) => arr.map((v, c) => v.padEnd(widths[c])).join("  ").trimEnd();
+  const title = `Trade ideas, weeks ${state.startWeek}–${state.endWeek} (${isMoney ? "expected $" : "proj. pts"})`;
+  return [title, "```", line(heads), ...cells.map(line), "```"].join("\n");
+}
+
+function tradeToText(p) { return rowsToTable([tradeRow(p)]); }
+
+function tradesToText(list) { return rowsToTable(list.map(tradeRow)); }
+
+function evaluateToText(data, partnerId, giveNames, getNames) {
+  const isMoney = data.objective === "money";
+  const pick = (side) => (isMoney ? side.money_delta : side.raw_delta);
+  const partner = state.teams.find((t) => t.team_id === partnerId);
+  return rowsToTable([{
+    partner: partner ? (partner.manager_name || partner.team_name) : "",
+    give: giveNames.join(" + "),
+    get: getNames.join(" + "),
+    you: impactText(pick(data.team_b), isMoney),
+    me: impactText(pick(data.team_a), isMoney),
+    isMoney,
+  }]);
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    // Fallback for non-secure contexts (e.g. opened via a LAN IP)
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (_) { /* ignore */ }
+    ta.remove();
+    return ok;
+  }
+}
+
+async function copyWithFeedback(btn, text) {
+  const original = btn.textContent;
+  const ok = await copyText(text);
+  btn.textContent = ok ? "Copied ✓" : "Copy failed";
+  setTimeout(() => { btn.textContent = original; }, 1400);
+}
+
 /* Chart.js dark-theme helpers -------------------------------------------- */
 
 function destroyChart(canvas) { if (canvas && canvas._chart) { canvas._chart.destroy(); canvas._chart = null; } }
@@ -1327,7 +1420,7 @@ function renderTradeResultsList(all) {
   const topN = Number($("t-topn").value);
   const shown = all.slice(0, topN);
 
-  const cards = shown.map((p) => `
+  const cards = shown.map((p, i) => `
     <div class="proposal-card">
       <div class="pick-row">
         <div class="give-get">
@@ -1342,6 +1435,7 @@ function renderTradeResultsList(all) {
           ${state.moneyMode
             ? `<span class="pill positive">${esc(p.partner_team_name)} ${money(p.partner_delta)}</span>`
             : `<span class="pill positive">${esc(p.partner_team_name)} ${signed1(p.partner_delta)}</span>`}
+          <button class="btn btn-ghost btn-sm" data-copy-trade="${i}">Copy</button>
         </div>
       </div>
     </div>`).join("");
@@ -1355,13 +1449,19 @@ function renderTradeResultsList(all) {
   const giveTop = topEntries(giveCounts, 10), getTop = topEntries(getCounts, 10);
 
   container.innerHTML = `
-    <div class="card"><div class="card-header"><h3>Showing ${shown.length} of ${all.length} win-win trades</h3></div>
+    <div class="card"><div class="card-header"><h3>Showing ${shown.length} of ${all.length} win-win trades</h3>
+        <button class="btn btn-sm" id="t-copy-all">Copy all shown</button></div>
       <div class="list-stack">${cards}</div>
     </div>
     <div class="two-col">
       <div class="card"><div class="card-header"><h3>Most frequently traded away</h3></div><div class="chart-box"><canvas id="t-give-chart"></canvas></div></div>
       <div class="card"><div class="card-header"><h3>Most frequently received</h3></div><div class="chart-box"><canvas id="t-get-chart"></canvas></div></div>
     </div>`;
+
+  container.querySelectorAll("[data-copy-trade]").forEach((btn) => {
+    btn.addEventListener("click", () => copyWithFeedback(btn, tradeToText(shown[Number(btn.dataset.copyTrade)])));
+  });
+  $("t-copy-all").addEventListener("click", (e) => copyWithFeedback(e.currentTarget, tradesToText(shown)));
 
   barChart($("t-give-chart"), giveTop.map((e) => e[0]), giveTop.map((e) => e[1]), { horizontal: true, color: "#f1585d" });
   barChart($("t-get-chart"), getTop.map((e) => e[0]), getTop.map((e) => e[1]), { horizontal: true, color: "#46d488" });
@@ -1422,9 +1522,15 @@ function checkedValues(prefix) {
   return Array.from(document.querySelectorAll(`input[name="${prefix}"]:checked`)).map((el) => el.value);
 }
 
+function checkedLabels(prefix) {
+  return Array.from(document.querySelectorAll(`input[name="${prefix}"]:checked`))
+    .map((el) => el.parentElement.querySelector("span").textContent);
+}
+
 async function runEvaluate() {
   const btn = $("e-run-btn"), results = $("e-results");
   const give = checkedValues("e-mine"), get = checkedValues("e-theirs");
+  const giveNames = checkedLabels("e-mine"), getNames = checkedLabels("e-theirs");
   if (!give.length || !get.length) { results.innerHTML = errorBanner("Pick at least one player on each side."); return; }
   const partnerId = Number($("e-partner").value);
   btn.disabled = true;
@@ -1435,7 +1541,7 @@ async function runEvaluate() {
       start_week: state.startWeek, end_week: state.endWeek, decay: decayOrNull(),
        objective: objective(),
     });
-    renderEvaluate(data, partnerId);
+    renderEvaluate(data, partnerId, giveNames, getNames);
   } catch (e) {
     results.innerHTML = errorBanner(e.message);
   } finally {
@@ -1443,7 +1549,7 @@ async function runEvaluate() {
   }
 }
 
-function renderEvaluate(data, partnerId) {
+function renderEvaluate(data, partnerId, giveNames, getNames) {
   const results = $("e-results");
   const a = data.team_a, b = data.team_b;
 
@@ -1454,6 +1560,7 @@ function renderEvaluate(data, partnerId) {
 
   results.innerHTML = `
     <div class="card">
+      <div class="card-header"><h3>Result</h3><button class="btn btn-sm" id="e-copy">Copy as text</button></div>
       <div class="card-grid">
         <div class="stat-card">
           <span class="label">${esc(teamLabel(state.teamId))}</span>
@@ -1471,6 +1578,9 @@ function renderEvaluate(data, partnerId) {
       <div class="card"><div class="card-header"><h3>${esc(teamLabel(state.teamId))}</h3></div><div class="chart-box"><canvas id="e-chart-a"></canvas></div></div>
       <div class="card"><div class="card-header"><h3>${esc(teamLabel(partnerId))}</h3></div><div class="chart-box"><canvas id="e-chart-b"></canvas></div></div>
     </div>`;
+
+  $("e-copy").addEventListener("click", (e) =>
+    copyWithFeedback(e.currentTarget, evaluateToText(data, partnerId, giveNames, getNames)));
 
   const weeksA = Object.keys(a.weekly_before).map(Number).sort((x, y) => x - y);
   const weeksB = Object.keys(b.weekly_before).map(Number).sort((x, y) => x - y);
